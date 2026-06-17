@@ -1,0 +1,485 @@
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+rf_extension.py  (v2 — PÉRDIDA ESPERADA CON DAMAGE RATIOS REALES)
+================================================================================
+AFP Integra — extensión de riesgo físico. Pregunta nueva del modelo:
+"¿Cuánto valor espero perder si el peligro se materializa?"
+
+REGLA DE ORO: ningún número sin fuente. Donde no hay fuente que respalde un
+damage ratio, el modelo declara "sin dato disponible" (en código y en UI), NO
+un número razonable inventado. Jerarquía de confianza explícita:
+    CALIBRADO  >  TRANSFERIDO  >  PROXY DECLARADO  >  SIN DATO
+(reporte de incertidumbre por niveles; FRAMEWORK: Hain et al. 2021.)
+
+No modifica el pipeline (dashboard_riesgos_fisicos_final.py): importa cero de él,
+recibe sus estructuras como input de solo lectura y escribe un HTML compañero.
+
+QUÉ SE PUDO CALIBRAR / TRANSFERIR Y QUÉ NO (resultado de leer los datos reales)
+------------------------------------------------------------------------------
+ INUNDACIÓN  -> TRANSFERIDO. Curvas Huizinga JRC 2017, columna "Centr&South
+                AMERICA", por tipo de activo (las cifras de HUIZINGA_SA son las
+                del archivo, no inventadas). Con tirante (EVAR) se usa directo;
+                sin tirante, score CENEPRED -> profundidad como PROXY DECLARADO.
+ RV vs RF     -> RV: daño amplificado por apalancamiento Activo/Patrimonio
+                (Merton). RF: K_RF NO es calibrable con datos peruanos (mercado
+                de bonos ilíquido, ratings AAA.pe pegajosos) -> SIN DATO.
+ MOV. MASA    -> PROXY DECLARADO solo donde hay inventario (Valderrama,
+                Cordillera Blanca/Áncash) + EM-DAT como tasa base. Categórico,
+                sin fracción de daño -> no produce S/, produce bandera.
+ SEQUÍA       -> SIN DATO CONCLUYENTE. La calibración GWh-hidro vs ICEN<-1.0 dio
+                señal invertida (La Niña = MÁS generación en Perú), no sequía.
+ FEN operativo-> SIN DATO CONCLUYENTE. TMF minería vs ICEN>1.5 (solo 2023, =El
+                Niño global) está centrado en cero (ruido); despachos de cemento
+                SUBEN en esos meses (demanda de reconstrucción). El método
+                diferencia-de-medias vs ICEN no aísla daño físico.
+ BANCA        -> CANAL INDIRECTO. B-2314 trae créditos/depósitos distritales,
+                NO morosidad -> DR territorial SIN DATO (FRAMEWORK: Chitchumnong
+                2025; la tesis "impacto del FEN" documenta la dirección en 2017).
+================================================================================
+"""
+
+import os
+import re
+import json
+import unicodedata
+from datetime import datetime
+
+import pandas as pd
+
+
+# ==============================================================================
+# 1) DAMAGE RATIOS CON FUENTE  (ningún número sin origen citado)
+# ==============================================================================
+
+# --- INUNDACIÓN: curvas Huizinga JRC, columna "Centr&South AMERICA" -----------
+# FRAMEWORK: Huizinga, De Moel & Szewczyk (2017), JRC Technical Report; usadas en
+#            Roncalli/Amundi (2026) como damage functions por tipo de activo.
+# CALIBRACIÓN: valores extraídos del archivo del proyecto
+#            global_flood_depth-damage_functions (hoja "Damage functions",
+#            columna Centr&South AMERICA). profundidad[m] -> fracción de daño.
+# LÍMITE: curva CONTINENTAL (no peruana); cóncava-saturante (no convexa). Es DR
+#            TRANSFERIDO, no calibrado localmente.
+HUIZINGA_SA = {
+    "Residential": {0.0: 0.0, 0.5: 0.491, 1.0: 0.711, 1.5: 0.842, 2.0: 0.949, 3.0: 0.984, 4.0: 1.0},
+    "Commercial":  {0.0: 0.0, 0.5: 0.611, 1.0: 0.840, 1.5: 0.924, 2.0: 0.992, 3.0: 1.0,   4.0: 1.0},
+    "Industrial":  {0.0: 0.0, 0.5: 0.667, 1.0: 0.889, 1.5: 0.947, 2.0: 1.0,   3.0: 1.0,   4.0: 1.0},
+    "Transport":   {0.0: 0.0, 0.5: 0.088, 1.0: 0.175, 1.5: 0.596, 2.0: 0.842, 3.0: 1.0,   4.0: 1.0},
+}
+
+# Mapeo sector de cartera -> tipo de activo Huizinga.
+# FRAMEWORK: enfoque asset-level sobre proxy de sede (MSCI 2025).
+# LÍMITE: aproximación por sector; un activo concreto puede diferir.
+SECTOR_ASSET_TYPE = {
+    "Minería": "Industrial", "Construcción": "Industrial", "Utilities": "Industrial",
+    "Energía": "Industrial", "Consumo": "Commercial", "Salud": "Commercial",
+    "Educación": "Commercial", "Infraestructura": "Transport",
+}
+ASSET_TYPE_DEFAULT = "Industrial"
+
+# Proxy DECLARADO score CENEPRED -> tirante (m), usado SOLO cuando no hay EVAR.
+# Es un proxy explícito (no un dato): el usuario autorizó usar el score como
+# proxy de periodo de retorno/profundidad y declararlo. DR_tipo => "proxy declarado".
+SCORE_DEPTH_PROXY_M = {1: 0.5, 2: 1.0, 3: 1.5, 4: 2.0, 5: 3.0}
+
+# Departamentos costa norte para la bandera ENSO (modulador, NO multiplicador).
+COSTA_NORTE_DEPS = {"PIURA", "LAMBAYEQUE", "LA LIBERTAD", "TUMBES", "ICA"}
+# Región con inventario de MM/aluviones disponible (Valderrama, Cordillera Blanca).
+MM_INVENTARIO_DEPS = {"ANCASH"}
+
+# Etiquetas de confianza (jerarquía de incertidumbre; Hain et al. 2021).
+TIER_CAL, TIER_TR, TIER_PROXY, TIER_NA = "calibrado", "transferido", "proxy declarado", "sin dato disponible"
+
+
+# ==============================================================================
+# 2) UTILIDADES
+# ==============================================================================
+
+def _norm(s):
+    if s is None:
+        return ""
+    s = str(s).strip().upper()
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", s)).strip()
+
+
+def _split_rv_rf(emisor, exp_clase):
+    """Fracción RV/RF (split uniforme en geografía, como el pipeline). FRAMEWORK:
+    diferenciación RF/RV (Azzone 2025)."""
+    d = exp_clase.get(emisor)
+    if not d or d.get("TOTAL", 0) <= 0:
+        return 1.0, 0.0
+    t = d["TOTAL"]
+    return d.get("RENTA VARIABLE", 0.0) / t, d.get("RENTA FIJA", 0.0) / t
+
+
+def _huizinga_dr(asset_type, depth_m):
+    """Interpola linealmente la curva Huizinga SA para un tipo de activo y tirante."""
+    curve = HUIZINGA_SA.get(asset_type, HUIZINGA_SA[ASSET_TYPE_DEFAULT])
+    xs = sorted(curve)
+    if depth_m <= xs[0]:
+        return curve[xs[0]]
+    if depth_m >= xs[-1]:
+        return curve[xs[-1]]
+    for i in range(1, len(xs)):
+        if depth_m <= xs[i]:
+            x0, x1 = xs[i - 1], xs[i]
+            y0, y1 = curve[x0], curve[x1]
+            return y0 + (y1 - y0) * (depth_m - x0) / (x1 - x0)
+    return curve[xs[-1]]
+
+
+# ==============================================================================
+# 3) ACTIVO / PATRIMONIO POR EMISOR  (para el apalancamiento RV; Merton)
+# ==============================================================================
+
+def cargar_activo_patrimonio(risk_path, sheet_val, equiv_canonico):
+    """Lee Activo/Patrimonio (cols W/Y de Valorización) por emisor canónico.
+    FRAMEWORK: Merton/Azzone 2025. CALIBRACIÓN: estados del emisor en Valorización
+    (origen SMV). LÍMITE: valores contables, punto en el tiempo."""
+    raw = pd.read_excel(risk_path, sheet_name=sheet_val, header=None, nrows=12)
+    hdr = None
+    for i in range(min(12, len(raw))):
+        j = " | ".join(_norm(v) for v in raw.iloc[i].tolist())
+        if "NOMBRE" in j and "ACTIVO" in j:
+            hdr = i
+            break
+    if hdr is None:
+        raise ValueError("rf_extension: no se halló encabezado Nombre/Activo en Valorización.")
+    df = pd.read_excel(risk_path, sheet_name=sheet_val, header=hdr).dropna(how="all")
+    cn = {_norm(c): c for c in df.columns}
+
+    def find(*sets):
+        for toks in sets:
+            for k, real in cn.items():
+                if all(t in k for t in toks):
+                    return real
+        return None
+
+    c_n = find(["NOMBRE", "G P"], ["NOMBRE"])
+    c_a = find(["ACTIVO", "EMISOR"], ["ACTIVO"])
+    c_p = find(["PATRIMONIO", "EMISOR"], ["PASTRIMONIO", "EMISOR"], ["PATRIMONIO"], ["PASTRIMONIO"])
+    if not all([c_n, c_a, c_p]):
+        raise ValueError("rf_extension: faltan columnas Activo/Patrimonio en Valorización.")
+    df = df.rename(columns={c_n: "nombre", c_a: "activo", c_p: "patrim"})
+    df["activo"] = pd.to_numeric(df["activo"], errors="coerce").fillna(0.0)
+    df["patrim"] = pd.to_numeric(df["patrim"], errors="coerce").fillna(0.0)
+    eqn = {_norm(k): v for k, v in equiv_canonico.items()}
+    out = {}
+    for _, r in df.iterrows():
+        em = eqn.get(_norm(r["nombre"]))
+        if em is None:
+            continue
+        d = out.setdefault(em, {"activo": 0.0, "patrimonio": 0.0})
+        d["activo"] = max(d["activo"], float(r["activo"]))
+        d["patrimonio"] = max(d["patrimonio"], float(r["patrim"]))
+    return out
+
+
+# ==============================================================================
+# 4) ESTADO ENSO (ICEN como MODULADOR / bandera, NO multiplicador inventado)
+# ==============================================================================
+
+def cargar_estado_enso(indic_path):
+    """Devuelve el estado ICEN vigente y su percentil histórico. ICEN se usa como
+    bandera de contexto, NO como multiplicador (no hay elasticidad calibrada)."""
+    est = {"icen": None, "icen_fecha": None, "percentil_hist": None, "alerta_costa_norte": False,
+           "nota": "ICEN como modulador/bandera; sin multiplicador (no calibrado)"}
+    if indic_path and os.path.exists(indic_path):
+        try:
+            df = pd.read_excel(indic_path, sheet_name="ICEN")
+            cf = next((c for c in df.columns if _norm(c) == "FECHA"), df.columns[0])
+            cv = next((c for c in df.columns if _norm(c) == "ICEN"), df.columns[-1])
+            df = df.dropna(subset=[cv]).sort_values(cf)
+            last = df.iloc[-1]
+            v = float(last[cv])
+            est["icen"] = round(v, 2)
+            est["icen_fecha"] = pd.to_datetime(last[cf]).strftime("%Y-%m")
+            est["percentil_hist"] = round((df[cv] <= v).mean() * 100, 1)
+            est["alerta_costa_norte"] = v > 1.0   # bandera, no número
+        except Exception as e:
+            est["nota"] = f"ICEN no leído ({e})."
+    return est
+
+
+# ==============================================================================
+# 5) PÉRDIDA ESPERADA  (solo donde hay DR con fuente; resto = SIN DATO)
+# ==============================================================================
+
+def calcular_perdida_esperada(districts, exp_clase, emp_sector, activo_patrimonio,
+                              canal_indirecto, enso_state, tirante_por_ubigeo=None):
+    """Calcula Pérdida Esperada S/ por empresa SOLO para inundación (único hazard
+    con DR con fuente: Huizinga SA). MM y sequía/FEN se reportan como banderas
+    categóricas o "sin dato", nunca como número inventado.
+
+    Inundación:  PE = Σ_distritos exp_RV × min(1, DR_huizinga(asset,profundidad) × Activo/Patrimonio)
+      - DR_huizinga: TRANSFERIDO (curvas SA del archivo JRC).
+      - profundidad: tirante EVAR si está en tirante_por_ubigeo (=> transferido),
+        si no, score CENEPRED -> SCORE_DEPTH_PROXY_M (=> proxy declarado).
+      - apalancamiento RV: Merton/Azzone 2025 (dato: Activo/Patrimonio).
+      - RF: K_RF no calibrable con datos PE => porción RF marcada SIN DATO (no suma S/).
+    """
+    tirante_por_ubigeo = tirante_por_ubigeo or {}
+    costa = {_norm(x) for x in COSTA_NORTE_DEPS}
+    mm_inv = {_norm(x) for x in MM_INVENTARIO_DEPS}
+
+    acc = {}  # emisor -> agregados
+    for d in districts:
+        dep = _norm(d.get("dep"))
+        for emisor, monto in d.get("empresas", {}).items():
+            if not monto or monto <= 0 or emisor in canal_indirecto:
+                continue
+            a = acc.setdefault(emisor, {
+                "sector": emp_sector.get(emisor, ""), "exp_total": 0.0,
+                "pe_inu_rv": 0.0, "exp_inu_rv": 0.0, "exp_rf_en_riesgo": 0.0,
+                "dr_inu_sumprod": 0.0, "tipo_inu": set(),
+                "mm_nivel": 0, "mm_inventario": False, "exp_seq": 0.0,
+                "costa_norte": False, "ap_disp": False})
+            a["exp_total"] += monto
+            frac_rv, frac_rf = _split_rv_rf(emisor, exp_clase)
+            ap = activo_patrimonio.get(emisor)
+            lev = (ap["activo"] / ap["patrimonio"]) if ap and ap.get("patrimonio", 0) > 0 else None
+            a["ap_disp"] = a["ap_disp"] or (lev is not None)
+            asset_type = SECTOR_ASSET_TYPE.get(a["sector"], ASSET_TYPE_DEFAULT)
+            if dep in costa:
+                a["costa_norte"] = True
+
+            # --- INUNDACIÓN (único con DR cuantificable) ---
+            sc_inu = d.get("score_inu")
+            if sc_inu is not None:
+                try:
+                    sc_i = int(round(float(sc_inu)))
+                except (TypeError, ValueError):
+                    sc_i = None
+                if sc_i is not None:
+                    ub = d.get("ubigeo")
+                    if ub in tirante_por_ubigeo:           # tirante real EVAR
+                        depth = float(tirante_por_ubigeo[ub]); a["tipo_inu"].add(TIER_TR)
+                    else:                                   # proxy declarado
+                        depth = SCORE_DEPTH_PROXY_M.get(sc_i)
+                        a["tipo_inu"].add(TIER_PROXY)
+                    if depth is not None:
+                        dr = _huizinga_dr(asset_type, depth)
+                        exp_rv = monto * frac_rv
+                        dr_rv = min(1.0, dr * lev) if lev is not None else dr
+                        a["pe_inu_rv"] += exp_rv * dr_rv
+                        a["exp_inu_rv"] += exp_rv
+                        a["dr_inu_sumprod"] += exp_rv * dr_rv
+                        a["exp_rf_en_riesgo"] += monto * frac_rf   # RF: sin dato (no suma S/)
+
+            # --- MOVIMIENTOS DE MASA (categórico, sin S/) ---
+            sc_mm = d.get("score_mm")
+            if sc_mm is not None:
+                try:
+                    a["mm_nivel"] = max(a["mm_nivel"], int(round(float(sc_mm))))
+                except (TypeError, ValueError):
+                    pass
+                if dep in mm_inv:
+                    a["mm_inventario"] = True
+
+            # --- SEQUÍA (sin dato concluyente; solo exposición marcada) ---
+            if d.get("score_seq") is not None:
+                a["exp_seq"] += monto
+
+    # --- armar filas por empresa ---
+    filas = []
+    for emisor, a in acc.items():
+        dr_ef = (a["dr_inu_sumprod"] / a["exp_inu_rv"]) if a["exp_inu_rv"] > 0 else None
+        tipo_inu = (TIER_TR if TIER_TR in a["tipo_inu"] else
+                    (TIER_PROXY if TIER_PROXY in a["tipo_inu"] else TIER_NA))
+        # hazard dominante (entre los que tienen evidencia)
+        if a["pe_inu_rv"] > 0:
+            dom = "Inundación"
+        elif a["mm_nivel"] >= 4 and a["mm_inventario"]:
+            dom = "Mov. de Masa (inventario)"
+        elif a["mm_nivel"] >= 4:
+            dom = "Mov. de Masa (sin inventario)"
+        elif a["exp_seq"] > 0:
+            dom = "Sequía (sin dato)"
+        else:
+            dom = "—"
+        filas.append({
+            "emisor": emisor, "sector": a["sector"], "exp_total": round(a["exp_total"], 2),
+            # DR de inundación (lo único cuantificado)
+            "dr_fuente": ("Huizinga JRC 2017, Centr&South America, %s"
+                          % SECTOR_ASSET_TYPE.get(a["sector"], ASSET_TYPE_DEFAULT)) if a["exp_inu_rv"] > 0 else "—",
+            "dr_valor": round(dr_ef, 3) if dr_ef is not None else None,
+            "dr_tipo": tipo_inu,
+            "perdida_esperada": round(a["pe_inu_rv"], 2),    # solo inundación RV
+            "exp_rf_sin_dato": round(a["exp_rf_en_riesgo"], 2),
+            "ap_disponible": a["ap_disp"],
+            "hazard_dom": dom,
+            # banderas categóricas (sin S/)
+            "mm_flag": ("alto (inventario Valderrama)" if (a["mm_nivel"] >= 4 and a["mm_inventario"])
+                        else "alto (sin inventario local)" if a["mm_nivel"] >= 4
+                        else "bajo" if a["mm_nivel"] > 0 else TIER_NA),
+            "seq_flag": ("expuesto — sin dato concluyente" if a["exp_seq"] > 0 else TIER_NA),
+            "enso_flag": (a["costa_norte"] and enso_state.get("alerta_costa_norte", False)),
+        })
+    filas.sort(key=lambda r: r["perdida_esperada"], reverse=True)
+
+    # --- canal indirecto (bancos/soberanos/extranjeros) ---
+    indirecto = [{"emisor": e, "sector": emp_sector.get(e, ""), "motivo": m}
+                 for e, m in canal_indirecto.items()]
+
+    # --- resumen ejecutivo ---
+    total_pe = sum(f["perdida_esperada"] for f in filas)
+    sin_dato = [f["emisor"] for f in filas if f["perdida_esperada"] == 0]
+    resumen = {
+        "total_perdida_esperada": round(total_pe, 2),
+        "por_hazard": {
+            "Inundación": round(total_pe, 2),
+            "Mov. de Masa": "sin dato (categórico)",
+            "Sequía": "sin dato concluyente",
+            "FEN operativo": "sin dato concluyente",
+        },
+        "empresas_sin_dato_S": sin_dato,
+        "n_empresas": len(filas),
+        "enso": enso_state,
+        "rf_no_cuantificado": round(sum(f["exp_rf_sin_dato"] for f in filas), 2),
+    }
+    return {"filas": filas, "indirecto": indirecto, "resumen": resumen}
+
+
+def detectar_canal_indirecto(districts, exp_clase, emp_sector, sector_financiero="Financiero"):
+    """Bancos (PD territorial, Chitchumnong 2025; B-2314 sin morosidad => sin dato)
+    y emisores sin cruce distrital (soberanos/extranjeros)."""
+    presentes = set()
+    for d in districts:
+        for e, m in d.get("empresas", {}).items():
+            if m and m > 0:
+                presentes.add(e)
+    out = {}
+    for e in exp_clase:
+        if emp_sector.get(e) == sector_financiero:
+            out[e] = "banco — PD territorial (Chitchumnong 2025); morosidad distrital: sin dato"
+        elif e not in presentes:
+            out[e] = "sin cruce distrital (soberano/extranjero/fondo)"
+    return out
+
+
+# ==============================================================================
+# 6) HTML COMPAÑERO — una sola pestaña "Pérdida Esperada"
+# ==============================================================================
+
+_TPL = r"""<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pérdida Esperada — Riesgo Físico · AFP Integra</title>
+<style>
+:root{--azul:#0b2e59;--cyan:#0aa3c2;--gris:#f4f6fa;--linea:#e2e7f0;}
+*{box-sizing:border-box}body{margin:0;font-family:Segoe UI,Roboto,Arial,sans-serif;color:#1a2433}
+header{background:var(--azul);color:#fff;padding:16px 22px}header h1{margin:0;font-size:18px}
+header p{margin:4px 0 0;opacity:.85;font-size:12.5px}
+.wrap{padding:18px 22px;max-width:1320px;margin:0 auto}
+.card{border:1px solid var(--linea);border-radius:10px;padding:14px 16px;margin-bottom:16px}
+.card h3{margin:0 0 8px;font-size:15px;color:var(--azul)}
+.kpi{display:inline-block;background:var(--gris);border:1px solid var(--linea);border-radius:8px;padding:8px 12px;margin:0 8px 8px 0;font-size:12px}
+.kpi b{display:block;font-size:17px;color:var(--azul)}
+table{border-collapse:collapse;width:100%;font-size:12.5px}
+thead th{position:sticky;top:0;background:var(--azul);color:#fff;padding:8px 10px;text-align:left;cursor:pointer;white-space:nowrap}
+td{padding:6px 10px;border-top:1px solid var(--linea)}tbody tr:hover td{background:#f7f9ff}
+.num{text-align:right;white-space:nowrap}
+.tier{font-size:11px;font-weight:700;padding:1px 7px;border-radius:10px}
+.t-transferido{background:#e7f4ff;color:#0b66a3}.t-proxy{background:#fff4e5;color:#8a5a00}
+.t-sd{background:#f0eef4;color:#6a6a7a}.t-cal{background:#e6f6ec;color:#1c7a3d}
+.flag{display:inline-block;background:#fdeaea;color:#a33;border-radius:6px;padding:1px 7px;font-size:11px;font-weight:700}
+.scroll{max-height:560px;overflow:auto;border:1px solid var(--linea);border-radius:8px}
+.legend{font-size:12px;color:#5a6678;margin:6px 0 0}
+.enso{padding:10px 14px;border-radius:8px;background:#eaf6fb;border:1px solid #bfe4f0;font-size:13px;margin-bottom:14px}
+ul.sd{columns:3;font-size:12px;color:#5a6678}
+</style></head><body>
+<header><h1>Pérdida Esperada por Riesgo Físico</h1>
+<p>AFP Integra · ¿Cuánto valor espero perder si el peligro se materializa? · <span id="stamp"></span></p></header>
+<div class="wrap">
+ <div class="enso" id="enso"></div>
+ <div class="card" id="kpis"></div>
+ <div class="card"><h3>Pérdida Esperada por empresa</h3>
+   <p class="legend">Jerarquía de confianza: <span class="tier t-cal">calibrado</span> &gt;
+   <span class="tier t-transferido">transferido</span> &gt; <span class="tier t-proxy">proxy declarado</span> &gt;
+   <span class="tier t-sd">sin dato disponible</span>. La Pérdida Esperada en S/ solo se calcula para
+   inundación (curva Huizinga SA × apalancamiento RV). RF, MM, sequía y FEN operativo: ver banderas.</p>
+   <div class="scroll" id="tabla"></div></div>
+ <div class="card"><h3>Resumen ejecutivo</h3><div id="resumen"></div></div>
+ <div class="card"><h3>Canal indirecto (sin daño directo de activo)</h3><div class="scroll" id="indirecto"></div></div>
+</div>
+<script>
+const DATA=__PAYLOAD__;
+const fmt=n=>(n==null)?"—":"S/ "+Number(n).toLocaleString("es-PE",{maximumFractionDigits:0});
+const tierClass=t=>({"transferido":"t-transferido","proxy declarado":"t-proxy","calibrado":"t-cal"}[t]||"t-sd");
+document.getElementById("stamp").textContent=DATA.stamp||"";
+const e=DATA.resumen.enso;
+document.getElementById("enso").innerHTML="Estado ENSO (modulador, no multiplicador): ICEN <b>"+(e.icen??"s/d")+
+ "</b>"+(e.icen_fecha?(" ("+e.icen_fecha+")"):"")+(e.percentil_hist!=null?(" · percentil histórico "+e.percentil_hist+"%"):"")+
+ (e.alerta_costa_norte?" · <span class='flag'>ALERTA costa norte (ICEN&gt;1.0)</span>":"");
+const r=DATA.resumen;
+document.getElementById("kpis").innerHTML=
+ "<div class='kpi'><b>"+fmt(r.total_perdida_esperada)+"</b>Pérdida esperada total (solo inundación)</div>"+
+ "<div class='kpi'><b>"+r.n_empresas+"</b>empresas evaluadas</div>"+
+ "<div class='kpi'><b>"+r.empresas_sin_dato_S.length+"</b>empresas sin S/ (solo banderas)</div>"+
+ "<div class='kpi'><b>"+fmt(r.rf_no_cuantificado)+"</b>exposición RF no cuantificada (K_RF sin dato)</div>";
+let h="<table><thead><tr>"+["Empresa","Sector","Exposición S/","DR fuente","DR valor","DR tipo",
+ "Pérdida Esperada S/","% portaf.","Hazard dom.","MM","Sequía","ENSO"].map((c,i)=>`<th data-i="${i}">${c}</th>`).join("")+"</tr></thead><tbody>";
+const tot=r.total_perdida_esperada||1;
+h+=DATA.filas.map(f=>`<tr>
+ <td>${f.emisor}</td><td>${f.sector}</td>
+ <td class="num" data-v="${f.exp_total}">${fmt(f.exp_total)}</td>
+ <td style="font-size:11px">${f.dr_fuente}</td>
+ <td class="num" data-v="${f.dr_valor??-1}">${f.dr_valor!=null?(100*f.dr_valor).toFixed(1)+"%":"—"}</td>
+ <td><span class="tier ${tierClass(f.dr_tipo)}">${f.dr_tipo}</span></td>
+ <td class="num" data-v="${f.perdida_esperada}">${f.perdida_esperada>0?fmt(f.perdida_esperada):"<span class='tier t-sd'>sin dato</span>"}</td>
+ <td class="num">${(100*f.perdida_esperada/tot).toFixed(1)}%</td>
+ <td>${f.hazard_dom}</td>
+ <td style="font-size:11px">${f.mm_flag}</td>
+ <td style="font-size:11px">${f.seq_flag}</td>
+ <td>${f.enso_flag?"<span class='flag'>alerta</span>":"—"}</td></tr>`).join("");
+h+="</tbody></table>";
+document.getElementById("tabla").innerHTML=h;
+let rh="<div class='kpi'><b>"+fmt(r.total_perdida_esperada)+"</b>Total cartera (inundación)</div>";
+rh+="<p style='font-size:12.5px'><b>Por hazard:</b> Inundación "+fmt(r.por_hazard["Inundación"])+
+ " · Mov. de Masa: <i>"+r.por_hazard["Mov. de Masa"]+"</i> · Sequía: <i>"+r.por_hazard["Sequía"]+
+ "</i> · FEN operativo: <i>"+r.por_hazard["FEN operativo"]+"</i></p>";
+rh+="<p style='font-size:12.5px'><b>Empresas sin pérdida en S/ (solo banderas):</b></p><ul class='sd'>"+
+ r.empresas_sin_dato_S.map(x=>"<li>"+x+"</li>").join("")+"</ul>";
+document.getElementById("resumen").innerHTML=rh;
+document.getElementById("indirecto").innerHTML="<table><thead><tr><th>Empresa</th><th>Sector</th><th>Motivo</th></tr></thead><tbody>"+
+ DATA.indirecto.map(x=>`<tr><td>${x.emisor}</td><td>${x.sector}</td><td style="font-size:11px">${x.motivo}</td></tr>`).join("")+"</tbody></table>";
+// ordenamiento
+document.querySelectorAll("th").forEach((th,i)=>th.onclick=()=>{const tb=th.closest("table").querySelector("tbody");
+ const rs=[...tb.rows];const asc=th.dataset.asc!=="1";th.dataset.asc=asc?"1":"0";
+ rs.sort((a,b)=>{let x=a.cells[i].dataset.v??a.cells[i].innerText,y=b.cells[i].dataset.v??b.cells[i].innerText;
+ let nx=parseFloat(x),ny=parseFloat(y);if(!isNaN(nx)&&!isNaN(ny)){x=nx;y=ny;}return(x>y?1:x<y?-1:0)*(asc?1:-1);});
+ rs.forEach(r=>tb.appendChild(r));});
+</script></body></html>"""
+
+
+def construir_html_companion(out_path, resultado, stamp=None):
+    payload = {"filas": resultado["filas"], "indirecto": resultado["indirecto"],
+               "resumen": resultado["resumen"],
+               "stamp": stamp or datetime.now().strftime("%Y-%m-%d %H:%M")}
+    html = _TPL.replace("__PAYLOAD__", json.dumps(payload, ensure_ascii=False))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return out_path
+
+
+# ==============================================================================
+# 7) ORQUESTADOR — único punto de entrada desde main()
+# ==============================================================================
+
+def generar_extension(out_dir, districts, exp_clase, emp_sector,
+                      risk_path, sheet_val, equiv_canonico,
+                      indic_path=None, tirante_por_ubigeo=None, stamp=None, logfn=print):
+    """Pega todo y escribe el HTML compañero. Todo aditivo y de solo lectura."""
+    if stamp is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    ap = cargar_activo_patrimonio(risk_path, sheet_val, equiv_canonico)
+    canal = detectar_canal_indirecto(districts, exp_clase, emp_sector)
+    enso = cargar_estado_enso(indic_path)
+    res = calcular_perdida_esperada(districts, exp_clase, emp_sector, ap, canal, enso,
+                                    tirante_por_ubigeo=tirante_por_ubigeo)
+    out = os.path.join(out_dir, f"Extension_PerdidaEsperada_{stamp}.html")
+    construir_html_companion(out, res, stamp=datetime.now().strftime("%Y-%m-%d %H:%M"))
+    logfn("Extensión Pérdida Esperada: %s | total inundación=%s | empresas=%d | sin S/=%d | ICEN=%s"
+          % (out, round(res["resumen"]["total_perdida_esperada"]), res["resumen"]["n_empresas"],
+             len(res["resumen"]["empresas_sin_dato_S"]), enso.get("icen")))
+    return out
