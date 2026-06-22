@@ -1,0 +1,869 @@
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+EXTRACCIÓN DE ESTADOS FINANCIEROS — MEMORIAS ANUALES SMV
+Portafolio de inversiones AFP Integra   (versión 100% local, SIN API)
+================================================================================
+
+Script único ejecutable desde Spyder (sin argumentos). Recorre la carpeta base,
+empareja cada PDF con su empresa canónica del portafolio, extrae el texto con un
+pipeline de 3 capas (pdfplumber -> PyMuPDF -> OCR) y lo estructura mediante un
+PARSER LOCAL en Python (sin servicios externos), calibrado con la estructura real
+de las memorias del SMV. El resultado se vuelca a un único Excel con una hoja por
+empresa más una hoja-resumen.
+
+QUÉ EXTRAE EL PARSER LOCAL
+--------------------------
+- Unidad de reporte: S/(000)->miles de soles, US$(000)->miles de dólares,
+  "S/ X millones"->millones de soles.
+- Estados financieros con líneas (situación financiera, resultados, resultados
+  integrales, cambios en el patrimonio neto, flujos de efectivo), distinguiendo
+  SEPARADO vs CONSOLIDADO, con columnas 2025 y 2024 y referencia de nota.
+- Tablas de ratios (Ratio Corriente, Ratio de Deuda, apalancamiento, etc.).
+- Desagregado por segmento/subsidiaria detectado en prosa (utilidad, ROE) — best
+  effort; el analista debe verificar contra el documento fuente.
+- Ignora el "Reporte sobre estructura accionaria por tipo de inversionista
+  (10190)", que no es un estado financiero.
+
+NOTAS
+-----
+- No usa pandas/tabula/camelot ni ninguna API externa.
+- Manejo de excepciones por empresa/archivo: un fallo no detiene el proceso.
+- OCR (capa 3) es opcional: si no está pytesseract/Tesseract, se desactiva.
+
+Dependencias mínimas: pdfplumber, openpyxl   (opcionales: pymupdf, pytesseract, pillow)
+================================================================================
+"""
+
+import os
+import re
+import glob
+import time
+import unicodedata
+
+import pdfplumber
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# Silenciar avisos ruidosos de pdfminer (p.ej. "Could not get FontBBox...")
+import logging
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
+logging.getLogger("pdfplumber").setLevel(logging.ERROR)
+
+# ------------------------------------------------------------------ #
+# 1. CONFIGURACIÓN (todas las rutas hardcodeadas)                     #
+# ------------------------------------------------------------------ #
+
+RUTA_BASE = r"C:\Users\usuario\OneDrive\Desktop\AFP INTEGRA\Docs privados\Otros\Memoria SMV Scraping"
+RUTA_SALIDA_EXCEL = os.path.join(RUTA_BASE, "Estados_Financieros_Portafolio.xlsx")
+RUTA_TEXTO_DUMP = os.path.join(RUTA_BASE, "_texto_extraido")   # auditoría opcional
+TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+GUARDAR_TEXTO_DUMP = True   # vuelca el texto extraído por empresa para auditoría
+BUSQUEDA_RECURSIVA = True   # busca PDFs también en subcarpetas
+
+# Umbrales del pipeline de extracción
+UMBRAL_NATIVA = 100      # caracteres mínimos para aceptar capa 1 o 2
+UMBRAL_OCR = 50          # caracteres mínimos para aceptar capa 3 (OCR)
+DPI_OCR = 200            # resolución de rasterizado para OCR
+UMBRAL_NO_PROCESABLE = 0.60   # >60% páginas no extraíbles -> "mayormente no procesable"
+
+# Años esperados en las columnas de los estados (para descartar cabeceras)
+ANIOS_VALIDOS = {2022, 2023, 2024, 2025, 2026, 2027}
+
+# Orden oficial del portafolio (nombres canónicos)
+PORTAFOLIO = [
+    "Cerro Verde", "Pacasmayo", "Aenza", "Ferreycorp", "Engie", "Volcan",
+    "BBVA", "Pluz Energia", "Puerto Chancay", "Orygen", "Buenaventura",
+    "Alicorp", "UNACEM", "Credicorp", "Nexa Perú", "InRetail", "Auna", "IFS",
+    "Minsur", "Hudbay", "Hunt Oil", "Hermes", "Colegios Peruanos",
+    "Casa Andina", "Inca Rail", "Intursa", "Jockey Plaza", "Lima Expresa",
+    "Orazen", "Primax", "Rutas de Lima", "Tecsup", "Hochshild",
+]
+
+# Alias / nemónicos bursátiles que no coinciden con el nombre canónico del archivo
+# (p.ej. "Memoria BVN 2025.pdf" -> Buenaventura).
+ALIASES = {
+    "Buenaventura": ["bvn"],
+    "Credicorp": ["bap", "credicorpltd"],
+}
+
+# ------------------------------------------------------------------ #
+# 2. CARGA OPCIONAL DE PyMuPDF Y OCR                                  #
+# ------------------------------------------------------------------ #
+
+PYMUPDF_DISPONIBLE = True
+try:
+    import fitz  # PyMuPDF
+except Exception as e:
+    PYMUPDF_DISPONIBLE = False
+    print(f"[ADVERTENCIA] PyMuPDF (fitz) no disponible: {e}. "
+          f"Se desactivan las capas 2 y 3 (OCR).")
+
+OCR_DISPONIBLE = True
+try:
+    import pytesseract
+    from PIL import Image
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+    if not os.path.exists(TESSERACT_CMD):
+        OCR_DISPONIBLE = False
+        print(f"[ADVERTENCIA] No se encontró tesseract.exe en {TESSERACT_CMD}. "
+              f"Capa 3 (OCR) desactivada.")
+except Exception as e:
+    OCR_DISPONIBLE = False
+    print(f"[ADVERTENCIA] pytesseract/Pillow no disponible: {e}. "
+          f"Capa 3 (OCR) desactivada (no afecta a los PDF nativos).")
+
+if not PYMUPDF_DISPONIBLE:
+    OCR_DISPONIBLE = False  # sin fitz no se puede rasterizar para OCR
+
+
+# ------------------------------------------------------------------ #
+# 3. UTILIDADES GENERALES                                            #
+# ------------------------------------------------------------------ #
+
+def normalizar(texto):
+    """Quita acentos, pasa a minúsculas y deja solo alfanuméricos."""
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]", "", texto.lower())
+
+
+def sin_acentos_min(texto):
+    """Minúsculas sin acentos pero conservando espacios y signos (para regex)."""
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return texto.lower()
+
+
+def nombre_hoja_valido(nombre):
+    """Sanea un nombre para hoja de Excel (<=31 chars, sin caracteres ilegales)."""
+    nombre = re.sub(r"[\[\]\:\*\?\/\\]", " ", nombre).strip()
+    return nombre[:31] if nombre else "Hoja"
+
+
+def mapear_archivos_a_empresas():
+    """
+    Busca PDFs (recursivo y sin distinguir mayúsculas) y los empareja con una
+    empresa canónica por coincidencia normalizada. Una empresa puede tener varios
+    archivos (anexos '_1', '_2', '_6'); todos se procesan y se fusionan.
+    Devuelve (mapeo, sin_emparejar, todos_los_pdfs).
+    """
+    todos = []
+    if BUSQUEDA_RECURSIVA:
+        for raiz, _dirs, files in os.walk(RUTA_BASE):
+            if os.path.basename(raiz) == os.path.basename(RUTA_TEXTO_DUMP):
+                continue  # no reprocesar nuestra propia carpeta de dumps
+            for f in files:
+                if f.lower().endswith(".pdf"):
+                    todos.append(os.path.join(raiz, f))
+    else:
+        todos = [p for p in glob.glob(os.path.join(RUTA_BASE, "*"))
+                 if p.lower().endswith(".pdf")]
+    todos = sorted(set(todos))
+
+    claves = sorted([(emp, normalizar(emp)) for emp in PORTAFOLIO],
+                    key=lambda x: len(x[1]), reverse=True)
+    # Añadir alias (nemónicos) como claves adicionales hacia su empresa canónica
+    for emp, lista in ALIASES.items():
+        for alias in lista:
+            claves.append((emp, normalizar(alias)))
+    claves.sort(key=lambda x: len(x[1]), reverse=True)
+
+    mapeo = {}
+    sin_emparejar = []
+    for ruta in todos:
+        base = os.path.basename(ruta)
+        prefijo = re.split(r"_\d{4}|_MEMORIA|_\d", base, maxsplit=1)[0]
+        clave_archivo = normalizar(prefijo) or normalizar(base)
+
+        emparejado = None
+        for emp, clave_emp in claves:
+            if clave_emp and (clave_emp in clave_archivo or clave_archivo in clave_emp):
+                emparejado = emp
+                break
+        if emparejado:
+            mapeo.setdefault(emparejado, []).append(ruta)
+        else:
+            sin_emparejar.append(ruta)
+
+    return mapeo, sin_emparejar, todos
+
+
+# ------------------------------------------------------------------ #
+# 4. PIPELINE DE EXTRACCIÓN DE TEXTO (3 CAPAS POR PÁGINA)             #
+# ------------------------------------------------------------------ #
+
+def extraer_texto_pdf(ruta):
+    """
+    Devuelve (paginas, metricas):
+      paginas  -> lista de dicts {num, texto, metodo}
+      metricas -> dict con conteos por método y flag de procesabilidad.
+    Pipeline por página: pdfplumber -> PyMuPDF -> OCR.
+    """
+    metricas = {"nativa": 0, "nativa_fitz": 0, "ocr": 0, "no_extraible": 0,
+                "total": 0, "mayormente_no_procesable": False}
+    paginas = []
+
+    doc_fitz = None
+    if PYMUPDF_DISPONIBLE:
+        try:
+            doc_fitz = fitz.open(ruta)
+        except Exception as e:
+            print(f"        [aviso] PyMuPDF no pudo abrir el PDF: {e}")
+            doc_fitz = None
+
+    with pdfplumber.open(ruta) as pdf:
+        total = len(pdf.pages)
+        metricas["total"] = total
+
+        for i in range(total):
+            num = i + 1
+            texto = ""
+            metodo = "no_extraible"
+
+            # --- CAPA 1: pdfplumber ---
+            try:
+                texto = pdf.pages[i].extract_text() or ""
+            except Exception:
+                texto = ""
+            if len(texto.strip()) >= UMBRAL_NATIVA:
+                metodo = "nativa"
+
+            # --- CAPA 2: PyMuPDF ---
+            if metodo == "no_extraible" and doc_fitz is not None:
+                try:
+                    t2 = doc_fitz.load_page(i).get_text("text") or ""
+                    if len(t2.strip()) >= UMBRAL_NATIVA:
+                        texto, metodo = t2, "nativa_fitz"
+                except Exception:
+                    pass
+
+            # --- CAPA 3: OCR ---
+            if metodo == "no_extraible" and OCR_DISPONIBLE and doc_fitz is not None:
+                try:
+                    pagina = doc_fitz.load_page(i)
+                    mat = fitz.Matrix(DPI_OCR / 72, DPI_OCR / 72)
+                    pix = pagina.get_pixmap(matrix=mat, alpha=False)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    t3 = pytesseract.image_to_string(img, lang="spa") or ""
+                    if len(t3.strip()) >= UMBRAL_OCR:
+                        texto, metodo = t3, "ocr"
+                except Exception as e:
+                    print(f"        [aviso] OCR falló en pág {num}: {e}")
+
+            metricas[metodo] += 1
+            paginas.append({"num": num, "texto": texto, "metodo": metodo})
+
+    if doc_fitz is not None:
+        doc_fitz.close()
+
+    if metricas["total"] > 0:
+        frac = metricas["no_extraible"] / metricas["total"]
+        metricas["mayormente_no_procesable"] = frac > UMBRAL_NO_PROCESABLE
+
+    return paginas, metricas
+
+
+# ------------------------------------------------------------------ #
+# 5. PARSER LOCAL DE ESTADOS FINANCIEROS                              #
+# ------------------------------------------------------------------ #
+
+# Token numérico: opcional paréntesis (negativo), miles con coma, decimal con punto
+_VALOR = r"\(?-?\d[\d,]*(?:\.\d+)?\)?"
+
+# Cola de "nota" al final del concepto (p.ej. "4.2.15 y 25", "33 (a)(v)")
+NOTE_TAIL = re.compile(
+    r"\s+\d+(?:\.\d+)*(?:\s*\([a-z0-9]+\))*(?:\s*y\s*\d+(?:\.\d+)*(?:\s*\([a-z0-9]+\))*)*\s*$",
+    re.IGNORECASE)
+
+# Cabecera de estado financiero (sobre texto sin acentos/min). Incluye nombres
+# alternativos: "balance general", "ganancias y perdidas", patrimonio sin "neto".
+HEADER_RE = re.compile(
+    r"estado\s+(?P<tipo>separado|consolidado|individual)?\s*de\s+"
+    r"(?P<estado>situacion financiera|balance general|resultados integrales|"
+    r"ganancias y perdidas|resultados|cambios en el patrimonio neto|"
+    r"cambios en el patrimonio|flujos de efectivo|flujo de efectivo)")
+HEADER_AUDIT_RE = re.compile(r"estado\s+de\s+resultados\s+auditados")
+
+# Terminadores: al verlos, se cierra el estado en curso
+TERMINADORES = (
+    "las notas adjuntas", "analisis de estados", "analisis y discusion",
+    "seccion ", "anexo", "reporte sobre estructura accionaria",
+    "datos generales", "carta del presidente",
+)
+
+# Palabras clave de ratios (restringidas: las genéricas como "cobertura" o
+# "margen" generan falsos positivos en las tablas de notas de reportes grandes).
+# Se usan límites de palabra para evitar subcadenas (p.ej. "roe" en "Electronoroeste").
+RATIO_RE = re.compile(
+    r"\b(?:ratio|roe|roa|ebitda|morosidad|apalancamiento|capital global)\b",
+    re.IGNORECASE)
+
+# Prosa: ROE/ROA por entidad   "ROE de Interbank ... 15.5% ... 12.2%"
+ROE_ENT_RE = re.compile(
+    r"\b(ROE|ROA)\s+de\s+([A-ZÁÉÍÓÚ][\wÁÉÍÓÚáéíóúñ&\.]+)"
+    r"[^.%]{0,70}?(\d+(?:\.\d+)?)\s*%"
+    r"(?:[^.%]{0,90}?(\d+(?:\.\d+)?)\s*%)?", re.IGNORECASE)
+
+# Prosa: utilidad/resultado neto por entidad
+UTIL_ENT_RE = re.compile(
+    r"(?:utilidad|resultado)\s+(?:neta\s+|neto\s+)?de\s+"
+    r"([A-ZÁÉÍÓÚ][\wÁÉÍÓÚáéíóúñ&\.]+)[^.]{0,50}?"
+    r"(S/|US\$)\s*([\d.,]+)\s*millones", re.IGNORECASE)
+
+# Prosa: EBITDA
+EBITDA_RE = re.compile(r"EBITDA\s+de\s+(US\$|S/)\s*([\d.,]+)\s*millones", re.IGNORECASE)
+
+_MAP_ESTADO = {
+    "situacion financiera": "Situación financiera",
+    "balance general": "Situación financiera",
+    "resultados integrales": "Resultados integrales",
+    "resultados": "Resultados",
+    "ganancias y perdidas": "Resultados",
+    "cambios en el patrimonio neto": "Cambios en el patrimonio neto",
+    "cambios en el patrimonio": "Cambios en el patrimonio neto",
+    "flujos de efectivo": "Flujos de efectivo",
+    "flujo de efectivo": "Flujos de efectivo",
+}
+
+
+def parse_num(token):
+    """Convierte un token numérico a float/int (paréntesis=negativo, % y comas fuera)."""
+    if token is None:
+        return None
+    t = token.strip()
+    neg = t.startswith("(") and t.endswith(")")
+    t = t.strip("()%").replace(",", "").replace(" ", "")
+    if t in ("", "-", "."):
+        return None
+    try:
+        v = float(t)
+    except ValueError:
+        return None
+    if neg:
+        v = -v
+    return int(v) if v == int(v) else v
+
+
+def _parsear_linea_item(linea):
+    """
+    Devuelve (concepto, nota, val_2025, val_2024) si la línea tiene dos columnas
+    numéricas al final; de lo contrario None. Toma SIEMPRE las dos últimas cifras.
+    """
+    matches = list(re.finditer(_VALOR, linea))
+    if len(matches) < 2:
+        return None
+    # Quitar "rulers" finales (líneas de subrayado tipo "____ ____") que algunas
+    # memorias colocan tras las cifras en el estado de resultados.
+    linea = re.sub(r"[\s_]+$", "", linea)
+    matches = list(re.finditer(_VALOR, linea))
+    if len(matches) < 2:
+        return None
+    m2 = matches[-1]   # 2024 (última)
+    m1 = matches[-2]   # 2025 (penúltima)
+    # Las dos cifras deben ser las últimas y estar contiguas (solo espacios entre sí)
+    if linea[m2.end():].strip() != "":
+        return None
+    if linea[m1.end():m2.start()].strip() != "":
+        return None
+    concepto_raw = linea[:m1.start()].rstrip()
+    v1 = parse_num(m1.group())
+    v2 = parse_num(m2.group())
+    if v1 is None or v2 is None:
+        return None
+    # Descartar cabeceras de año (p.ej. "Nota 2025 2024", "2025 2024")
+    if v1 in ANIOS_VALIDOS and v2 in ANIOS_VALIDOS:
+        return None
+    # Separar nota al final del concepto
+    nota = None
+    mnota = NOTE_TAIL.search(concepto_raw)
+    if mnota:
+        candidato = concepto_raw[:mnota.start()].rstrip()
+        if len(re.sub(r"[^a-zA-Z]", "", candidato)) >= 3:
+            nota = concepto_raw[mnota.start():].strip()
+            concepto_raw = candidato
+    concepto = concepto_raw.strip(" .:-")
+    if len(re.sub(r"[^a-zA-Z]", "", concepto)) < 3:
+        return None
+    return concepto, nota, v1, v2
+
+
+def _es_terminador(norm):
+    return any(norm.startswith(t) or t in norm[:40] for t in TERMINADORES)
+
+
+def parsear_documento(paginas):
+    """
+    Parser principal. Recibe las páginas extraídas y devuelve un dict con:
+      unidad, consolidado, desagregado, ratios, notas
+    """
+    datos = {"unidad": None, "consolidado": [], "desagregado": [],
+             "ratios": [], "notas": ""}
+
+    texto_completo = "\n".join(p["texto"] for p in paginas)
+    lineas = texto_completo.splitlines()
+    norm_full = sin_acentos_min(texto_completo)
+
+    # --- Unidad de reporte ---
+    if "us$(000)" in norm_full or "usd(000)" in norm_full:
+        datos["unidad"] = "miles de dólares"
+    elif "s/(000)" in norm_full:
+        datos["unidad"] = "miles de soles"
+    elif "millones de soles" in norm_full:
+        datos["unidad"] = "millones de soles"
+    elif "millones de dolares" in norm_full:
+        datos["unidad"] = "millones de dólares"
+    elif "us$" in norm_full and "millones" in norm_full and "s/" not in norm_full:
+        datos["unidad"] = "millones de dólares (cifras en prosa)"
+    elif "s/" in norm_full and "millones" in norm_full:
+        datos["unidad"] = "millones de soles (cifras en prosa)"
+    elif "us$" in norm_full and "millones" in norm_full:
+        datos["unidad"] = "millones de dólares (cifras en prosa)"
+
+    # --- Pase de líneas: estados con líneas + ámbito separado/consolidado ---
+    estado_actual = None
+    tipo_actual = None
+    ambito = None
+    lineas_en_estado = 0          # ventana de seguridad por estado abierto
+    MAX_LINEAS_ESTADO = 90        # un estado real rara vez supera esto
+
+    for linea in lineas:
+        cruda = linea.rstrip()
+        norm = sin_acentos_min(cruda).strip()
+        if not norm:
+            continue
+
+        if "estados financieros separados" in norm:
+            ambito = "separado"
+        elif "estados financieros consolidados" in norm:
+            ambito = "consolidado"
+
+        # Cabecera de estado: SOLO si la línea es un título que EMPIEZA por
+        # "estado" (evita falsos positivos cuando la frase aparece embebida en la
+        # prosa de las notas, p.ej. "...reconocidos en el estado separado de...").
+        # Se tolera numeración inicial ("1. Estado de...") y títulos largos que
+        # incluyen la fecha o la unidad en la misma línea.
+        norm_t = norm.lstrip("0123456789.()-•* \t")
+        es_titulo = norm_t.startswith("estado") and len(norm_t) <= 140
+        mh = HEADER_RE.match(norm_t) if es_titulo else None
+        if mh:
+            estado_actual = _MAP_ESTADO.get(mh.group("estado"))
+            tipo_actual = mh.group("tipo") or ambito or "individual"
+            lineas_en_estado = 0
+            continue
+        if es_titulo and HEADER_AUDIT_RE.match(norm_t):
+            estado_actual = "Resultados"
+            tipo_actual = ambito or "separado"
+            lineas_en_estado = 0
+            continue
+
+        if _es_terminador(norm):
+            estado_actual = None
+            tipo_actual = None
+            continue
+
+        if estado_actual is not None:
+            lineas_en_estado += 1
+            if lineas_en_estado > MAX_LINEAS_ESTADO:
+                estado_actual = None      # cierre por ventana (no es estado real)
+                tipo_actual = None
+                continue
+            item = _parsear_linea_item(cruda)
+            if item:
+                concepto, nota, v1, v2 = item
+                datos["consolidado"].append({
+                    "estado": estado_actual, "tipo": tipo_actual,
+                    "concepto": concepto, "valor_2025": v1,
+                    "valor_2024": v2, "nota": nota})
+
+    # --- Pase de ratios (tablas) ---
+    ambito = None
+    n = len(lineas)
+    for i in range(n):
+        cruda = lineas[i].rstrip()
+        norm = sin_acentos_min(cruda).strip()
+        if not norm:
+            continue
+        if "estados financieros separados" in norm:
+            ambito = "separado"
+        elif "estados financieros consolidados" in norm:
+            ambito = "consolidado"
+        if not RATIO_RE.search(cruda):
+            continue
+        item = _parsear_linea_item(cruda)
+        if not item:
+            # Nombre de ratio "envuelto": fusionar SOLO si esta línea no trae
+            # cifras propias (evita pegar encabezados tipo "Ratios ... 2025 2024").
+            if len(re.findall(_VALOR, cruda)) != 0:
+                continue
+            fusion = cruda
+            intentos = 0
+            j = i + 1
+            while j < n and intentos < 2:
+                sig = lineas[j].rstrip()
+                if sig.strip():
+                    fusion = fusion + " " + sig.strip()
+                    item = _parsear_linea_item(fusion)
+                    if item:
+                        break
+                    intentos += 1
+                j += 1
+            if not item:
+                continue
+        concepto, _nota, v1, v2 = item
+        if v1 in ANIOS_VALIDOS and v2 in ANIOS_VALIDOS:
+            continue  # cabecera "Ratios de Liquidez 2025 2024"
+        # Un ratio/indicador no toma valores de miles ni cientos: descartar tablas
+        # de notas (coberturas, derivados, métricas GRI) que cuelan números grandes.
+        if abs(v1) > 100 or abs(v2) > 100:
+            continue
+        # Compactar espacios del nombre fusionado
+        concepto = re.sub(r"\s+", " ", concepto).strip()
+        datos["ratios"].append({
+            "nombre": concepto, "tipo": ambito,
+            "valor_2025": v1, "valor_2024": v2})
+
+    # --- Pases de prosa (best effort) ---
+    for m in ROE_ENT_RE.finditer(texto_completo):
+        indicador, entidad = m.group(1).upper(), m.group(2).strip(" .")
+        datos["desagregado"].append({
+            "unidad_negocio": entidad, "concepto": indicador,
+            "valor_2025": parse_num(m.group(3)),
+            "valor_2024": parse_num(m.group(4)) if m.group(4) else None,
+            "unidad": "%"})
+    for m in UTIL_ENT_RE.finditer(texto_completo):
+        entidad = m.group(1).strip(" .")
+        moneda = "soles" if m.group(2) == "S/" else "dólares"
+        datos["desagregado"].append({
+            "unidad_negocio": entidad, "concepto": "Utilidad / resultado neto",
+            "valor_2025": parse_num(m.group(3)), "valor_2024": None,
+            "unidad": f"millones de {moneda}"})
+    for m in EBITDA_RE.finditer(texto_completo):
+        moneda = "soles" if m.group(1) == "S/" else "dólares"
+        datos["ratios"].append({
+            "nombre": f"EBITDA (millones de {moneda})", "tipo": None,
+            "valor_2025": parse_num(m.group(2)), "valor_2024": None})
+
+    datos["consolidado"] = _dedup(datos["consolidado"])
+    datos["desagregado"] = _dedup(datos["desagregado"])
+    datos["ratios"] = _dedup(datos["ratios"])
+    return datos
+
+
+def _dedup(filas):
+    """Elimina dicts duplicados preservando el orden."""
+    vistos = set()
+    salida = []
+    for f in filas:
+        clave = tuple(sorted((k, str(v)) for k, v in f.items()))
+        if clave not in vistos:
+            vistos.add(clave)
+            salida.append(f)
+    return salida
+
+
+# ------------------------------------------------------------------ #
+# 6. ESCRITURA DEL EXCEL                                              #
+# ------------------------------------------------------------------ #
+
+_FONT_TITULO = Font(bold=True, size=13, color="FFFFFF")
+_FILL_TITULO = PatternFill("solid", fgColor="1F4E78")
+_FONT_SECCION = Font(bold=True, size=11, color="FFFFFF")
+_FILL_SECCION = PatternFill("solid", fgColor="2E75B6")
+_FONT_HEADER = Font(bold=True, size=10)
+_FILL_HEADER = PatternFill("solid", fgColor="D9E1F2")
+_FONT_LEYENDA = Font(italic=True, size=12, color="808080")
+_BORDE = Border(*[Side(style="thin", color="BFBFBF")] * 4)
+
+
+def _escribir_tabla(ws, fila, encabezados, filas_datos):
+    for c, enc in enumerate(encabezados, start=1):
+        cel = ws.cell(row=fila, column=c, value=enc)
+        cel.font = _FONT_HEADER
+        cel.fill = _FILL_HEADER
+        cel.border = _BORDE
+    fila += 1
+    for datos in filas_datos:
+        for c, val in enumerate(datos, start=1):
+            cel = ws.cell(row=fila, column=c, value=val)
+            cel.border = _BORDE
+        fila += 1
+    return fila + 1
+
+
+def _titulo_seccion(ws, fila, texto, ancho=6):
+    cel = ws.cell(row=fila, column=1, value=texto)
+    cel.font = _FONT_SECCION
+    for c in range(1, ancho + 1):
+        ws.cell(row=fila, column=c).fill = _FILL_SECCION
+    return fila + 1
+
+
+def escribir_hoja_empresa(wb, empresa, archivos, datos, metricas_lista, estado):
+    ws = wb.create_sheet(title=nombre_hoja_valido(empresa))
+
+    cel = ws.cell(row=1, column=1, value=f"{empresa} — Estados Financieros")
+    cel.font = _FONT_TITULO
+    for c in range(1, 7):
+        ws.cell(row=1, column=c).fill = _FILL_TITULO
+
+    fila = 3
+    ws.cell(row=fila, column=1, value="Archivo(s):").font = _FONT_HEADER
+    ws.cell(row=fila, column=2, value=", ".join(os.path.basename(a) for a in archivos))
+    fila += 1
+    ws.cell(row=fila, column=1, value="Unidad de reporte:").font = _FONT_HEADER
+    ws.cell(row=fila, column=2, value=(datos.get("unidad") or "—"))
+    fila += 1
+    ws.cell(row=fila, column=1, value="Estado de procesamiento:").font = _FONT_HEADER
+    ws.cell(row=fila, column=2, value=estado)
+    fila += 1
+
+    agg = {"nativa": 0, "nativa_fitz": 0, "ocr": 0, "no_extraible": 0, "total": 0}
+    for m in metricas_lista:
+        for k in agg:
+            agg[k] += m.get(k, 0)
+    ws.cell(row=fila, column=1, value="Páginas (nat/fitz/ocr/no_ext/total):").font = _FONT_HEADER
+    ws.cell(row=fila, column=2,
+            value=f"{agg['nativa']} / {agg['nativa_fitz']} / {agg['ocr']} / "
+                  f"{agg['no_extraible']} / {agg['total']}")
+    fila += 2
+
+    # Estados financieros (con líneas)
+    fila = _titulo_seccion(ws, fila, "ESTADOS FINANCIEROS")
+    filas = [[it.get("estado"), it.get("tipo"), it.get("concepto"),
+              it.get("valor_2025"), it.get("valor_2024"), it.get("nota")]
+             for it in (datos.get("consolidado") or [])]
+    if not filas:
+        filas = [["(sin estados con líneas; ver NOTAS / texto fuente)", "", "", "", "", ""]]
+    fila = _escribir_tabla(ws, fila,
+                           ["Estado", "Tipo", "Concepto", "2025", "2024", "Nota"], filas)
+
+    # Desagregado por segmento / unidad de negocio
+    fila = _titulo_seccion(ws, fila, "DESAGREGADO POR SEGMENTO / UNIDAD DE NEGOCIO (heurístico)")
+    filas = [[it.get("unidad_negocio"), it.get("concepto"),
+              it.get("valor_2025"), it.get("valor_2024"), it.get("unidad")]
+             for it in (datos.get("desagregado") or [])]
+    if not filas:
+        filas = [["(sin desagregación detectada)", "", "", "", ""]]
+    fila = _escribir_tabla(ws, fila,
+                           ["Unidad de negocio", "Concepto", "2025", "2024", "Unidad"], filas)
+
+    # Ratios / indicadores
+    fila = _titulo_seccion(ws, fila, "RATIOS / INDICADORES")
+    filas = [[it.get("nombre"), it.get("tipo"),
+              it.get("valor_2025"), it.get("valor_2024")]
+             for it in (datos.get("ratios") or [])]
+    if not filas:
+        filas = [["(sin ratios explícitos detectados)", "", "", ""]]
+    fila = _escribir_tabla(ws, fila, ["Indicador", "Tipo", "2025", "2024"], filas)
+
+    # Notas
+    fila = _titulo_seccion(ws, fila, "NOTAS")
+    nota_base = ("Cifras extraídas con parser local (heurístico). El bloque "
+                 "'desagregado' proviene de prosa: verificar contra el documento "
+                 "fuente. ")
+    ws.cell(row=fila, column=1, value=nota_base + (datos.get("notas") or ""))
+    ws.cell(row=fila, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+
+    for c, w in enumerate([34, 16, 46, 16, 16, 14], start=1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+
+
+def escribir_hoja_sin_documento(wb, empresa):
+    ws = wb.create_sheet(title=nombre_hoja_valido(empresa))
+    cel = ws.cell(row=1, column=1, value=f"{empresa} — Estados Financieros")
+    cel.font = _FONT_TITULO
+    for c in range(1, 7):
+        ws.cell(row=1, column=c).fill = _FILL_TITULO
+    cel2 = ws.cell(row=3, column=1, value="Sin documento disponible en SMV")
+    cel2.font = _FONT_LEYENDA
+    ws.column_dimensions["A"].width = 40
+
+
+def escribir_hoja_resumen(wb, filas_resumen):
+    ws = wb.create_sheet(title="Resumen", index=0)
+    cel = ws.cell(row=1, column=1, value="RESUMEN DE PROCESAMIENTO — PORTAFOLIO AFP INTEGRA")
+    cel.font = _FONT_TITULO
+    for c in range(1, 9):
+        ws.cell(row=1, column=c).fill = _FILL_TITULO
+
+    encabezados = ["#", "Empresa", "Estado", "Archivo(s)", "Nativas",
+                   "Fitz", "OCR", "No extraíbles"]
+    fila = 3
+    for c, enc in enumerate(encabezados, start=1):
+        cel = ws.cell(row=fila, column=c, value=enc)
+        cel.font = _FONT_HEADER
+        cel.fill = _FILL_HEADER
+        cel.border = _BORDE
+    fila += 1
+    for r in filas_resumen:
+        for c, val in enumerate(r, start=1):
+            cel = ws.cell(row=fila, column=c, value=val)
+            cel.border = _BORDE
+        fila += 1
+
+    for c, w in enumerate([5, 22, 34, 38, 10, 8, 8, 14], start=1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+
+
+# ------------------------------------------------------------------ #
+# 7. FLUJO PRINCIPAL                                                  #
+# ------------------------------------------------------------------ #
+
+def main():
+    print("=" * 70)
+    print("EXTRACCIÓN DE ESTADOS FINANCIEROS — MEMORIAS SMV (AFP Integra)")
+    print("Modo: 100% local (sin API)")
+    print("=" * 70)
+    print(f"Carpeta base : {RUTA_BASE}")
+    print(f"PyMuPDF      : {PYMUPDF_DISPONIBLE}")
+    print(f"OCR activo   : {OCR_DISPONIBLE}")
+    print("-" * 70)
+
+    if not os.path.isdir(RUTA_BASE):
+        print("[ERROR] No existe la carpeta base. Verifica la ruta y reintenta.")
+        return
+
+    # 7.1 Mapear archivos a empresas + diagnóstico
+    mapeo, sin_emparejar, todos = mapear_archivos_a_empresas()
+    print(f"PDFs detectados en la carpeta (recursivo={BUSQUEDA_RECURSIVA}): {len(todos)}")
+    if not todos:
+        print("[DIAGNÓSTICO] No se encontró ningún .pdf. Contenido de la carpeta base:")
+        try:
+            for entrada in sorted(os.listdir(RUTA_BASE))[:40]:
+                ruta_e = os.path.join(RUTA_BASE, entrada)
+                tipo = "<DIR>" if os.path.isdir(ruta_e) else "     "
+                print(f"   {tipo} {entrada}")
+        except Exception as e:
+            print(f"   (no se pudo listar la carpeta: {e})")
+        print("   Sugerencias: revisa que los PDF estén en esta ruta (o subcarpetas),")
+        print("   que la extensión sea .pdf y que OneDrive los tenga descargados localmente.")
+    else:
+        print(f"   Emparejados con el portafolio: "
+              f"{sum(len(v) for v in mapeo.values())} en {len(mapeo)} empresa(s).")
+        if sin_emparejar:
+            print(f"   [aviso] {len(sin_emparejar)} sin emparejar: "
+                  f"{[os.path.basename(a) for a in sin_emparejar]}")
+    print("-" * 70)
+
+    if GUARDAR_TEXTO_DUMP:
+        try:
+            os.makedirs(RUTA_TEXTO_DUMP, exist_ok=True)
+        except Exception as e:
+            print(f"[aviso] No se pudo crear carpeta de dumps: {e}")
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    filas_resumen = []
+
+    # 7.2 Recorrer el portafolio EN ORDEN OFICIAL
+    for idx, empresa in enumerate(PORTAFOLIO, start=1):
+        print(f"[{idx:02d}/{len(PORTAFOLIO)}] {empresa}")
+
+        if empresa not in mapeo:
+            escribir_hoja_sin_documento(wb, empresa)
+            if empresa in SIN_DOCUMENTO:
+                estado = "Sin documento disponible en SMV"
+                print("      -> Sin documento disponible en SMV.")
+            else:
+                estado = "Sin PDF en la carpeta"
+                print("      -> No se encontró PDF en la carpeta.")
+            filas_resumen.append([idx, empresa, estado, "—", "", "", "", ""])
+            continue
+
+        archivos = mapeo[empresa]
+        paginas_totales = []
+        metricas_lista = []
+        notas_proceso = []
+
+        for ruta in archivos:
+            base = os.path.basename(ruta)
+            try:
+                print(f"      Extrayendo texto de: {base}")
+                paginas, metricas = extraer_texto_pdf(ruta)
+                paginas_totales.extend(paginas)
+                metricas_lista.append(metricas)
+                etiqueta = (" [MAYORMENTE NO PROCESABLE]"
+                            if metricas["mayormente_no_procesable"] else "")
+                print(f"        páginas: nat={metricas['nativa']} "
+                      f"fitz={metricas['nativa_fitz']} ocr={metricas['ocr']} "
+                      f"no_ext={metricas['no_extraible']} "
+                      f"total={metricas['total']}{etiqueta}")
+                if metricas["mayormente_no_procesable"]:
+                    notas_proceso.append(f"{base}: mayormente no procesable")
+            except Exception as e:
+                print(f"        [ERROR] No se pudo procesar {base}: {e}")
+                notas_proceso.append(f"{base}: ERROR de extracción ({e})")
+                metricas_lista.append({"nativa": 0, "nativa_fitz": 0, "ocr": 0,
+                                       "no_extraible": 0, "total": 0,
+                                       "mayormente_no_procesable": True})
+
+        # Volcado de texto para auditoría
+        if GUARDAR_TEXTO_DUMP and paginas_totales:
+            try:
+                destino = os.path.join(RUTA_TEXTO_DUMP, f"{nombre_hoja_valido(empresa)}.txt")
+                with open(destino, "w", encoding="utf-8") as fh:
+                    for p in paginas_totales:
+                        fh.write(f"\n===== Página {p['num']} [{p['metodo']}] =====\n")
+                        fh.write(p["texto"] or "")
+            except Exception as e:
+                print(f"      [aviso] No se pudo guardar el dump de texto: {e}")
+
+        # Parseo local
+        try:
+            datos = parsear_documento(paginas_totales)
+        except Exception as e:
+            print(f"      [ERROR] Falló el parseo local: {e}")
+            datos = {"unidad": None, "consolidado": [], "desagregado": [],
+                     "ratios": [], "notas": f"Parseo fallido: {e}"}
+
+        if notas_proceso:
+            datos["notas"] = (datos.get("notas", "") + " || " +
+                              " || ".join(notas_proceso)).strip(" |")
+
+        agg = {"nativa": 0, "nativa_fitz": 0, "ocr": 0, "no_extraible": 0, "total": 0}
+        for m in metricas_lista:
+            for k in agg:
+                agg[k] += m.get(k, 0)
+        hay_eeff = bool(datos.get("consolidado") or datos.get("ratios"))
+        if agg["total"] == 0:
+            estado = "PDF no legible / error"
+        elif any(m.get("mayormente_no_procesable") for m in metricas_lista):
+            estado = "Procesado parcialmente (mayormente no procesable)"
+        elif hay_eeff:
+            estado = "Procesado OK"
+        else:
+            estado = "Procesado (sin EEFF: posible anexo, p.ej. reporte 10190)"
+
+        escribir_hoja_empresa(wb, empresa, archivos, datos, metricas_lista, estado)
+        filas_resumen.append([
+            idx, empresa, estado,
+            ", ".join(os.path.basename(a) for a in archivos),
+            agg["nativa"], agg["nativa_fitz"], agg["ocr"], agg["no_extraible"]])
+        print(f"      -> {estado} "
+              f"(EEFF:{len(datos['consolidado'])} ratios:{len(datos['ratios'])} "
+              f"desagr:{len(datos['desagregado'])})")
+
+    # 7.3 Resumen y guardado
+    escribir_hoja_resumen(wb, filas_resumen)
+    try:
+        wb.save(RUTA_SALIDA_EXCEL)
+        print("-" * 70)
+        print(f"[OK] Excel generado en:\n     {RUTA_SALIDA_EXCEL}")
+    except PermissionError:
+        alterno = RUTA_SALIDA_EXCEL.replace(
+            ".xlsx", f"_{time.strftime('%Y%m%d_%H%M%S')}.xlsx")
+        wb.save(alterno)
+        print(f"[OK] El destino estaba bloqueado; guardado en:\n     {alterno}")
+    except Exception as e:
+        print(f"[ERROR] No se pudo guardar el Excel: {e}")
+
+    print("=" * 70)
+    print("Proceso finalizado.")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
