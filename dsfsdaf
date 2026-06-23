@@ -1,0 +1,1 @@
+clima_itcp=fen_chart.get("clima", {}).get("ITCP", []),
