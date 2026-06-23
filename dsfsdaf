@@ -1,1 +1,13 @@
-clima_itcp=fen_chart.get("clima", {}).get("ITCP", []),
+actx.generar_dashboard_activos(
+            out_dir=OUT_DIR,
+            districts=districts,
+            exp_clase=exp_clase,
+            aum_cartera=aum_cartera,
+            emp_sector=emp_sector,
+            risk_path=risk_path,
+            geojson=geojson,
+            enfen=enfen,
+            stamp=stamp,
+            mitigantes_path=r"Z:\Mesa de Inversiones\...\Inputs\Mitigantes.xlsx",
+            clima_itcp=fen_chart.get("clima", {}).get("ITCP", []),   # <-- AGREGAR ESTA LÍNEA
+            logfn=lambda m: log(m))
