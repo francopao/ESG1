@@ -1,0 +1,53 @@
+# ============================================================
+#  setup_task_scheduler.ps1
+#  Registra la tarea en el Programador de Tareas de Windows
+#  para ejecutar BD_Equity_Research.py a las 09:00 y 15:00
+#
+#  INSTRUCCIONES:
+#    1. Abre PowerShell como Administrador
+#    2. Ejecuta:  .\setup_task_scheduler.ps1
+#    3. Verifica en: Inicio → "Programador de tareas" → busca "BD_EquityResearch"
+# ============================================================
+
+# ── Configura aquí tus rutas ─────────────────────────────────
+$NombreTarea  = "AFP_Integra_BD_EquityResearch"
+$RutaBat      = "Z:\Mesa de Inversiones\Bottom-Up\Franco\run_BD_EquityResearch.bat"
+$UsuarioPC    = $env:USERNAME          # toma automáticamente tu usuario de Windows
+
+# ── Acciones ─────────────────────────────────────────────────
+$accion = New-ScheduledTaskAction `
+    -Execute "cmd.exe" `
+    -Argument "/c `"$RutaBat`""
+
+# ── Disparadores: 09:00 y 15:00, todos los días laborables ───
+$trigger09 = New-ScheduledTaskTrigger `
+    -Daily -At "09:00AM"
+
+$trigger15 = New-ScheduledTaskTrigger `
+    -Daily -At "03:00PM"
+
+# ── Configuración de la tarea ─────────────────────────────────
+$configuracion = New-ScheduledTaskSettingsSet `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
+    -MultipleInstances IgnoreNew `
+    -StartWhenAvailable `       # si la PC estaba apagada, ejecuta al encenderse
+    -WakeToRun:$false
+
+# ── Registrar ─────────────────────────────────────────────────
+Register-ScheduledTask `
+    -TaskName    $NombreTarea `
+    -Action      $accion `
+    -Trigger     $trigger09, $trigger15 `
+    -Settings    $configuracion `
+    -RunLevel    Highest `
+    -Force `
+    -Description "Alerta automatica de nuevas publicaciones BD Equity Research - AFP Integra RVL"
+
+Write-Host ""
+Write-Host "✅ Tarea '$NombreTarea' registrada correctamente." -ForegroundColor Green
+Write-Host "   Horarios: 09:00 y 15:00 todos los dias." -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Para verificar:" -ForegroundColor Yellow
+Write-Host "  taskschd.msc  →  Biblioteca del Programador de Tareas" -ForegroundColor Yellow
+Write-Host "  O ejecuta en PowerShell:" -ForegroundColor Yellow
+Write-Host "  Get-ScheduledTask -TaskName '$NombreTarea' | Get-ScheduledTaskInfo" -ForegroundColor Yellow
