@@ -4489,6 +4489,309 @@ def generar_dashboard_activos(out_dir, districts, exp_clase, aum_cartera,
     return out_path
 
 
+def _periodo_actual(mitigantes_path=None):
+    """Etiqueta de semestre ('1S26', '2S25', ...). Si hay archivo de mitigantes usa
+    la hoja de semestre encontrada; si no, la calcula de la fecha."""
+    from datetime import datetime
+    hoy = datetime.now()
+    anio2 = str(hoy.year)[-2:]
+    sem = '1' if hoy.month <= 6 else '2'
+    candidatos = [f"{sem}S{anio2}",
+                  (f"2S{str(hoy.year - 1)[-2:]}" if sem == '1' else f"1S{anio2}")]
+    if mitigantes_path and os.path.exists(mitigantes_path):
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(mitigantes_path, read_only=True)
+            hojas = wb.sheetnames
+            wb.close()
+            for c in candidatos:
+                if c in hojas:
+                    return c
+        except Exception:
+            pass
+    return candidatos[0]
+
+
+def _mit_lookup(emisor, mitigantes):
+    """Busca el mitigante de un emisor tolerando tildes/mayusculas."""
+    if emisor in mitigantes:
+        return mitigantes[emisor]
+    import unicodedata
+
+    def nrm(s):
+        return "".join(c for c in unicodedata.normalize("NFD", str(s))
+                       if unicodedata.category(c) != "Mn").lower().strip()
+    ne = nrm(emisor)
+    for k, v in mitigantes.items():
+        if nrm(k) == ne:
+            return v
+    return "\u2014"
+
+
+def _calc_scores_py(districts):
+    """Score CENEPRED por emisor y peligro, ponderado por la plata del emisor en
+    cada distrito (cartera total). Distritos sin score cuentan 0 (denominador =
+    plata total del emisor). Misma logica que calcScores() del dashboard."""
+    tot, perd = {}, {}
+    for d in districts:
+        acc = {}
+        for a in d.get("aportes", []):
+            m = a.get("monto", 0) or 0
+            if m > 0:
+                acc[a["emisor"]] = acc.get(a["emisor"], 0) + m
+        for e, m in acc.items():
+            tot[e] = tot.get(e, 0) + m
+            perd.setdefault(e, []).append(
+                (d.get("score_mm"), d.get("score_inu"), d.get("score_seq"), m))
+    out = {}
+    for e, T in tot.items():
+        amm = ainu = aseq = 0.0
+        for mm, inu, seq, m in perd[e]:
+            f = (m / T) if T else 0
+            amm += f * (mm if isinstance(mm, (int, float)) else 0)
+            ainu += f * (inu if isinstance(inu, (int, float)) else 0)
+            aseq += f * (seq if isinstance(seq, (int, float)) else 0)
+        g = (amm + ainu + aseq) / 3
+        out[e] = {"mm": round(amm, 2), "inu": round(ainu, 2),
+                  "seq": round(aseq, 2), "global": round(g, 2)}
+    return out
+
+
+def generar_excel_riesgos(out_dir, districts, exp_clase, emp_sector, mitigantes,
+                          periodo, fx, stamp=None, logfn=print):
+    """Genera 'Riesgos Climáticos - <periodo>.xlsx' con hojas: Resumen, Activos por
+    Empresa, Activos N-D, Score por Empresa, Score por Sector y Mitigantes. Data
+    estructurada semestral para construir historia."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from datetime import datetime
+
+    AZUL = "1E2E6E"; GRISBG = "F1F3F8"
+    F_TIT = Font(name="Calibri", size=14, bold=True, color=AZUL)
+    F_SUB = Font(name="Calibri", size=10, color="7E8083")
+    F_HEAD = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+    F_BODY = Font(name="Calibri", size=10, color="1F2533")
+    F_BOLD = Font(name="Calibri", size=10, bold=True, color="1F2533")
+    FILL_HEAD = PatternFill("solid", fgColor=AZUL)
+    THIN = Side(style="thin", color="DCDDDE")
+    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    A_L = Alignment(horizontal="left", vertical="center")
+    A_C = Alignment(horizontal="center", vertical="center")
+    A_R = Alignment(horizontal="right", vertical="center")
+    FMT_S = '#,##0;(#,##0);-'
+    FMT_SC = '0.00'
+
+    def fill_score(v):
+        if v < 2:  return PatternFill("solid", fgColor="D4EDDA")
+        if v < 3:  return PatternFill("solid", fgColor="FFF3CD")
+        if v <= 4: return PatternFill("solid", fgColor="FFE0B2")
+        return PatternFill("solid", fgColor="F8D7DA")
+
+    def fill_mit(v):
+        return {"Bajo": PatternFill("solid", fgColor="D4EDDA"),
+                "Medio": PatternFill("solid", fgColor="FFF3CD"),
+                "Alto": PatternFill("solid", fgColor="F8D7DA")}.get(v)
+
+    def header_row(ws, row, cols, widths=None):
+        for j, txt in enumerate(cols, start=1):
+            c = ws.cell(row=row, column=j, value=txt)
+            c.font = F_HEAD; c.fill = FILL_HEAD; c.alignment = A_C; c.border = BORDER
+        if widths:
+            for j, w in enumerate(widths, start=1):
+                ws.column_dimensions[get_column_letter(j)].width = w
+
+    fxv = (fx or {}).get("valor", 3.5)
+
+    scores = _calc_scores_py(districts)
+    activos = []
+    aum_emp = {}
+    for e in scores:
+        aum_emp[e] = (exp_clase.get(e, {}) or {}).get("TOTAL", 0)
+    for d in districts:
+        for a in d.get("aportes", []):
+            m = a.get("monto", 0) or 0
+            if m <= 0:
+                continue
+            acts = a.get("activos") or ["(activo s/d)"]
+            cuota = m / len(acts)
+            for nom in acts:
+                activos.append({
+                    "emisor": a["emisor"],
+                    "sector": a.get("sector") or emp_sector.get(a["emisor"], ""),
+                    "activo": nom, "ubigeo": d.get("ubigeo"),
+                    "dep": d.get("dep"), "prov": d.get("prov"),
+                    "dist": d.get("dist"), "plata": cuota,
+                    "mm": d.get("score_mm"), "inu": d.get("score_inu"),
+                    "seq": d.get("score_seq")})
+
+    wb = Workbook()
+    emisores = sorted(scores.keys())
+    sectores = sorted({s for s in emp_sector.values() if s})
+
+    # ---- HOJA 1: RESUMEN ----
+    ws = wb.active; ws.title = "Resumen"; ws.sheet_view.showGridLines = False
+    ws["A1"] = "Riesgos Climáticos - Activos Físicos y Riesgo CENEPRED"; ws["A1"].font = F_TIT
+    ws["A2"] = (f"Periodo {periodo} - Generado {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                f" - TC USD {fxv}"); ws["A2"].font = F_SUB
+    n_act = len(activos)
+    n_nd = sum(1 for x in activos if not all(isinstance(x[k], (int, float))
+               for k in ("mm", "inu", "seq")))
+    aum_total = sum(aum_emp.values())
+    r = 4
+    for nombre, val, fmt in [("AUM total mapeado (S/)", aum_total, FMT_S),
+                             ("Empresas mapeadas", len(emisores), '#,##0'),
+                             ("Activos físicos", n_act, '#,##0'),
+                             ("Activos con peligro N/D", n_nd, '#,##0')]:
+        ws.cell(row=r, column=1, value=nombre).font = F_BOLD
+        c = ws.cell(row=r, column=2, value=val); c.font = F_BODY
+        c.number_format = fmt; c.alignment = A_R
+        r += 1
+    ws.column_dimensions["A"].width = 34; ws.column_dimensions["B"].width = 18
+    r += 1
+    ws.cell(row=r, column=1, value="Resumen por sector").font = F_TIT; r += 1
+    header_row(ws, r, ["Sector", "Empresas", "Activos", "AUM total (S/)", "Score Global (pond.)"])
+    r += 1
+    for sec in sectores:
+        emps = [e for e in emisores if emp_sector.get(e) == sec]
+        if not emps:
+            continue
+        nact = sum(1 for x in activos if x["sector"] == sec)
+        aum_s = sum(aum_emp[e] for e in emps)
+        gp = (sum(scores[e]["global"] * aum_emp[e] for e in emps) / aum_s) if aum_s else 0
+        for j, v in enumerate([sec, len(emps), nact, aum_s, round(gp, 2)], start=1):
+            c = ws.cell(row=r, column=j, value=v); c.font = F_BODY; c.border = BORDER
+            c.alignment = A_L if j == 1 else (A_R if j == 4 else A_C)
+            if j == 4: c.number_format = FMT_S
+            if j == 5: c.number_format = FMT_SC; c.fill = fill_score(round(gp, 2))
+        r += 1
+    for j, w in enumerate([26, 12, 10, 18, 20], start=1):
+        ws.column_dimensions[get_column_letter(j)].width = w
+    ws.freeze_panes = "A4"
+
+    # ---- HOJA 2: ACTIVOS POR EMPRESA ----
+    ws = wb.create_sheet("Activos por Empresa"); ws.sheet_view.showGridLines = False
+    header_row(ws, 1, ["Empresa", "Sector", "AUM Total Empresa (S/)", "Activo Físico",
+                       "Departamento", "Provincia", "Distrito", "Score MM",
+                       "Score Inund.", "Score Sequía", "Plata del Activo (S/)"],
+               [26, 16, 20, 30, 16, 18, 18, 10, 11, 11, 18])
+    r = 2
+    for x in sorted(activos, key=lambda z: (z["emisor"], -z["plata"])):
+        fila = [x["emisor"], x["sector"], aum_emp.get(x["emisor"], 0), x["activo"],
+                x["dep"], x["prov"], x["dist"],
+                x["mm"] if isinstance(x["mm"], (int, float)) else "N/D",
+                x["inu"] if isinstance(x["inu"], (int, float)) else "N/D",
+                x["seq"] if isinstance(x["seq"], (int, float)) else "N/D",
+                round(x["plata"], 2)]
+        for j, v in enumerate(fila, start=1):
+            c = ws.cell(row=r, column=j, value=v); c.font = F_BODY; c.border = BORDER
+            c.alignment = A_L if j in (1, 2, 4, 5, 6, 7) else (A_R if j in (3, 11) else A_C)
+            if j in (3, 11): c.number_format = FMT_S
+        r += 1
+    ws.freeze_panes = "A2"
+    if r > 2: ws.auto_filter.ref = f"A1:K{r-1}"
+
+    # ---- HOJA 3: ACTIVOS N-D ----
+    ws = wb.create_sheet("Activos N-D"); ws.sheet_view.showGridLines = False
+    ws["A1"] = ("Activos físicos en distritos SIN score CENEPRED valido para el peligro "
+                "indicado (catalogados 'N/D' en el dashboard)."); ws["A1"].font = F_SUB
+    header_row(ws, 2, ["Empresa", "Sector", "Activo Físico", "Ubigeo", "Departamento",
+                       "Provincia", "Distrito", "Peligro sin score",
+                       "Plata del Activo (S/)", "% del AUM de la empresa"],
+               [26, 16, 30, 10, 16, 18, 18, 18, 18, 20])
+    HZP = [("mm", "Movimientos de Masa"), ("inu", "Inundación"), ("seq", "Sequías Severas")]
+    r = 3
+    for x in sorted(activos, key=lambda z: (z["emisor"], -z["plata"])):
+        for key, etiqueta in HZP:
+            if not isinstance(x[key], (int, float)):
+                aum_e = aum_emp.get(x["emisor"], 0) or 0
+                pct = (x["plata"] / aum_e) if aum_e else 0
+                fila = [x["emisor"], x["sector"], x["activo"], x["ubigeo"], x["dep"],
+                        x["prov"], x["dist"], etiqueta, round(x["plata"], 2), pct]
+                for j, v in enumerate(fila, start=1):
+                    c = ws.cell(row=r, column=j, value=v); c.font = F_BODY; c.border = BORDER
+                    c.alignment = A_L if j in (1, 2, 3, 5, 6, 7) else (A_R if j in (9, 10) else A_C)
+                    if j == 9: c.number_format = FMT_S
+                    if j == 10: c.number_format = '0.00%'
+                r += 1
+    ws.freeze_panes = "A3"
+    if r > 3: ws.auto_filter.ref = f"A2:J{r-1}"
+
+    # ---- HOJA 4: SCORE POR EMPRESA ----
+    ws = wb.create_sheet("Score por Empresa"); ws.sheet_view.showGridLines = False
+    ws["A1"] = "Detalle del Score CENEPRED por empresa (ponderado por AUM distrital)"
+    ws["A1"].font = F_TIT
+    ws["A2"] = ("Score por peligro = suma( plata del emisor en el distrito / plata total "
+                "del emisor x score CENEPRED del distrito ). Score Global = promedio de los "
+                "tres peligros. Mitigante: nivel del periodo (archivo Mitigantes).")
+    ws["A2"].font = F_SUB
+    header_row(ws, 4, ["Empresa", "Sector", "AUM Total (S/)", "Score MM", "Score Inund.",
+                       "Score Sequía", "Score Global", "Mitigante (" + str(periodo) + ")"],
+               [26, 16, 18, 11, 12, 12, 13, 18])
+    r = 5
+    for e in sorted(emisores, key=lambda z: -scores[z]["global"]):
+        s = scores[e]; mit = _mit_lookup(e, mitigantes)
+        fila = [e, emp_sector.get(e, ""), aum_emp.get(e, 0),
+                s["mm"], s["inu"], s["seq"], s["global"], mit]
+        for j, v in enumerate(fila, start=1):
+            c = ws.cell(row=r, column=j, value=v); c.font = F_BODY; c.border = BORDER
+            c.alignment = A_L if j in (1, 2) else (A_R if j == 3 else A_C)
+            if j == 3: c.number_format = FMT_S
+            if j in (4, 5, 6, 7): c.number_format = FMT_SC; c.fill = fill_score(v)
+            if j == 8 and fill_mit(v): c.fill = fill_mit(v)
+        r += 1
+    ws.freeze_panes = "A5"
+    if r > 5: ws.auto_filter.ref = f"A4:H{r-1}"
+
+    # ---- HOJA 5: SCORE POR SECTOR ----
+    ws = wb.create_sheet("Score por Sector"); ws.sheet_view.showGridLines = False
+    ws["A1"] = "Score CENEPRED por sector (agregado, ponderado por AUM)"; ws["A1"].font = F_TIT
+    header_row(ws, 3, ["Sector", "Empresas", "AUM Total (S/)", "Score MM", "Score Inund.",
+                       "Score Sequía", "Score Global"], [26, 12, 18, 11, 12, 12, 13])
+    r = 4
+    sec_rows = []
+    for sec in sectores:
+        emps = [e for e in emisores if emp_sector.get(e) == sec]
+        if not emps:
+            continue
+        aum_s = sum(aum_emp[e] for e in emps) or 1
+        agg = {k: round(sum(scores[e][k] * aum_emp[e] for e in emps) / aum_s, 2)
+               for k in ("mm", "inu", "seq", "global")}
+        sec_rows.append((sec, len(emps), sum(aum_emp[e] for e in emps), agg))
+    for sec, nemp, aum_s, agg in sorted(sec_rows, key=lambda z: -z[3]["global"]):
+        fila = [sec, nemp, aum_s, agg["mm"], agg["inu"], agg["seq"], agg["global"]]
+        for j, v in enumerate(fila, start=1):
+            c = ws.cell(row=r, column=j, value=v); c.font = F_BODY; c.border = BORDER
+            c.alignment = A_L if j == 1 else (A_R if j == 3 else A_C)
+            if j == 3: c.number_format = FMT_S
+            if j in (4, 5, 6, 7): c.number_format = FMT_SC; c.fill = fill_score(v)
+        r += 1
+    ws.freeze_panes = "A4"
+
+    # ---- HOJA 6: MITIGANTES ----
+    ws = wb.create_sheet("Mitigantes"); ws.sheet_view.showGridLines = False
+    ws["A1"] = f"Mitigantes considerados - periodo {periodo}"; ws["A1"].font = F_TIT
+    ws["A2"] = "Fuente: archivo Mitigantes (1=Bajo, 2=Medio, 3=Alto)."; ws["A2"].font = F_SUB
+    header_row(ws, 4, ["Empresa", "Mitigante", "Periodo"], [30, 16, 12])
+    r = 5
+    if mitigantes:
+        for emp, val in sorted(mitigantes.items()):
+            for j, v in enumerate([emp, val, periodo], start=1):
+                c = ws.cell(row=r, column=j, value=v); c.font = F_BODY; c.border = BORDER
+                c.alignment = A_L if j == 1 else A_C
+                if j == 2 and fill_mit(v): c.fill = fill_mit(v)
+            r += 1
+    else:
+        ws.cell(row=5, column=1, value="(No se cargó archivo de mitigantes)").font = F_SUB
+    ws.freeze_panes = "A5"
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"Riesgos Climáticos - {periodo}.xlsx")
+    wb.save(out_path)
+    logfn(f"[Activos] Excel generado: {out_path}")
+    return out_path
+
+
 # ==============================================================================
 # 3) TEMPLATE HTML + JS (Leaflet)
 # ==============================================================================
@@ -4573,6 +4876,9 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
  table.tbl3 th.idx{background:var(--grisbg);color:var(--azul);font-weight:700;text-align:left;}
  table.tbl3 td{padding:5px 10px;border:1px solid var(--linea);text-align:center;white-space:nowrap;}
  table.tbl3 td.idx{background:var(--grisbg);color:var(--azul);font-weight:700;text-align:left;border:1px solid var(--linea);}
+ .tbl3-chk{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--plomo);margin:6px 0;cursor:pointer;}
+ table.tbl3 tr.tbl3-total td{background:#eef3ff;font-weight:700;color:var(--azul);}
+ table.tbl3 tr.tbl3-total td.idx{background:#dde6fb;}
  table.piv td.aumtot{background:#eef3ff;vertical-align:middle;font-weight:700;
    color:var(--azul);text-align:right;white-space:nowrap;}
  table.piv td.num{text-align:right;white-space:nowrap;}
@@ -4581,7 +4887,6 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
  body.ocultar-montos .monto{display:none;}
  .act{color:var(--txt);cursor:help;border-bottom:1px dotted #aab;}
  body.ocultar-activo .col-activo{display:none;}
- body.ocultar-nd .fila-nd{display:none;}
  table.piv tbody tr:hover td:not(.riesgo):not(.aumtot){background:#f7f9ff;}
  /* ---- Mapa ---- */
  .mapbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px;}
@@ -4630,7 +4935,6 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <label class="chk"><input type="checkbox" id="chkMonto"> Mostrar montos</label>
     <label class="chk"><input type="checkbox" id="chkActivo" checked> Columna "Activo"</label>
     <label class="chk"><input type="checkbox" id="chkSync" checked> Sincronizar mapas</label>
-    <label class="chk"><input type="checkbox" id="chkND" checked> Mostrar N/D</label>
     <div class="seg" title="Moneda de los montos">
       <button id="mPEN" class="on">S/</button>
       <button id="mUSD">US$</button>
@@ -4742,7 +5046,14 @@ function activosDeDistrito(d){
 function buildTablaHTML(hz){
   const col = hz.col;
   const ck = classKey();
-  const denom = AUM_MAP[ck] || 1;   // CAMBIO 1: denominador mapeado (suma a 100%)
+  // Denominador SIN N/D: AUM de emisores mapeados con score válido (1-5) para este
+  // peligro. Así los 5 niveles suman 100% (se eliminan las filas N/D).
+  let denom = 0;
+  D.forEach(d=>{
+    if([1,2,3,4,5].indexOf(d[col])<0) return;
+    (d.ap||[]).forEach(a=>{ const m=a.m*classFrac(a.e); if(m>0) denom+=m; });
+  });
+  denom = denom || 1;
   // bucket[nivel][emisor] = {amt, activos:[{activo,plata,dep,prov,dist}]}
   const bucket={}; NIV.forEach(L=>bucket[L]={});
   D.forEach(d=>{
@@ -4779,26 +5090,6 @@ function buildTablaHTML(hz){
           '</span><span class="monto">'+fmtMonto(aumL)+'</span></td>'+
           '<td class="emis-line">'+lista+'</td></tr>';
   });
-  // CAMBIO 2 — Fila N/D: emisores con aportes pero sin score válido para este peligro
-  const bucketND={};
-  D.forEach(d=>{
-    const L=d[col];
-    if([1,2,3,4,5].indexOf(L)>=0) return;
-    (d.ap||[]).forEach(a=>{
-      const m=a.m*classFrac(a.e); if(m<=0) return;
-      bucketND[a.e]=(bucketND[a.e]||0)+m;
-    });
-  });
-  const emsND=Object.entries(bucketND).sort((a,b)=>b[1]-a[1]);
-  const aumND=emsND.reduce((s,e)=>s+e[1],0);
-  if(emsND.length>0){
-    const listaND=emsND.map(e=>e[0]).join(', ');
-    resH+='<tr class="fila-nd">'+
-      '<td class="riesgo" style="background:#7E8083;font-size:12px;font-weight:700">N/D</td>'+
-      '<td class="aumtot"><span class="pct">'+fmtP(aumND/denom)+'</span>'+
-      '<span class="monto">'+fmtMonto(aumND)+'</span></td>'+
-      '<td class="emis-line">'+listaND+'</td></tr>';
-  }
   resH+='</tbody>';
   // filas
   let rows=[];
@@ -4856,58 +5147,6 @@ function buildTablaHTML(hz){
     h+='<td class="col-activo act-list">'+actHtml+'</td>';
     h+='</tr>';
   });
-  // CAMBIO 3 — Filas N/D de detalle (emisores con aportes sin score válido para este peligro)
-  const bucketND_det={};
-  D.forEach(d=>{
-    const L=d[col];
-    if([1,2,3,4,5].indexOf(L)>=0) return;
-    (d.ap||[]).forEach(a=>{
-      const m=a.m*classFrac(a.e); if(m<=0) return;
-      const b=bucketND_det[a.e] || (bucketND_det[a.e]={amt:0,activos:[],sector:a.s});
-      b.amt+=m;
-      const acts=(a.ac&&a.ac.length)?a.ac:['(activo s/d)'];
-      const cuota=m/acts.length;
-      acts.forEach(n=>b.activos.push({activo:n,plata:cuota,dep:d.dep,prov:d.prov,dist:d.dist}));
-    });
-  });
-  const emsND_det=Object.entries(bucketND_det).sort((a,b)=>b[1].amt-a[1].amt);
-  if(emsND_det.length>0){
-    const aumND_det=emsND_det.reduce((s,e)=>s+e[1].amt,0);
-    const cntND=emsND_det.length;
-    emsND_det.forEach(([emisor,b],idx)=>{
-      const porAct={};
-      b.activos.forEach(x=>{
-        const k=x.activo;
-        if(!porAct[k]) porAct[k]={activo:k,plata:0,ubic:{}};
-        porAct[k].plata+=x.plata;
-        const uk=x.dist+' ('+x.prov+', '+x.dep+')';
-        porAct[k].ubic[uk]=(porAct[k].ubic[uk]||0)+x.plata;
-      });
-      const top3=Object.values(porAct).sort((a,b)=>b.plata-a.plata).slice(0,3);
-      const nTot=Object.keys(porAct).length;
-      h+='<tr class="fila-nd">';
-      if(idx===0){
-        h+='<td class="riesgo" style="background:#7E8083;font-size:12px;font-weight:700" rowspan="'+cntND+'">N/D</td>';
-        h+='<td class="aumtot" rowspan="'+cntND+'"><span class="pct">'+fmtP(aumND_det/denom)+
-           '</span><span class="monto">'+fmtMonto(aumND_det)+'</span></td>';
-      }
-      h+='<td><b>'+emisor+'</b><br><span class="monto" style="color:var(--plomo)">'+
-         (EMP_SECTOR[emisor]||b.sector||'')+'</span></td>';
-      const emisorTot=(EXP_CLASE[emisor]&&EXP_CLASE[emisor].TOTAL)||0;
-      const ep=emisorTot? b.amt/emisorTot : 0;
-      h+='<td class="num"><span class="pct">'+fmtP(ep)+'</span><span class="monto">'+
-         fmtMonto(b.amt)+'</span></td>';
-      let actHtml=top3.map(a=>{
-        const ub=Object.entries(a.ubic).sort((x,y)=>y[1]-x[1])
-          .map(e=>e[0]+': '+fmtMonto(e[1])).join(' | ');
-        const tip=(a.activo+' — '+fmtMonto(a.plata)+'  ·  '+ub).replace(/"/g,'&quot;');
-        return '<span class="act" title="'+tip+'">'+a.activo+
-               ' <span class="monto" style="display:inline">'+fmtMonto(a.plata)+'</span></span>';
-      }).join('<br>');
-      if(nTot>3) actHtml+='<br><span class="monto" style="display:inline">(+'+(nTot-3)+' activos más)</span>';
-      h+='<td class="col-activo act-list">'+actHtml+'</td></tr>';
-    });
-  }
   h+='</tbody>';
   return armarCapas(resH, h, hz.key);
 }
@@ -5320,44 +5559,78 @@ function redibujarTablas(){
 }
 function redibujarMapas(){ MAPAS.forEach(m=>m.render()); }
 
-// CAMBIO 3: tabla transpuesta (AUM por nivel CENEPRED) vinculada a los filtros del mapa
+// Estado del selector "Desglosar" (exclusivo de chart 3, independiente del mapa)
+const DESGLOSE_TBL3={};
+function toggleDesglose(hzkey, checked){
+  DESGLOSE_TBL3[hzkey]=checked;
+  const hz=HZ.find(h=>h.key===hzkey);
+  const m=MAPAS.find(x=>x.hz.key===hzkey);
+  buildTbl3(hz, m?m.filtroEmisor:null, m?m.filtroSector:null);
+}
+
+// CAMBIO 3: tabla transpuesta (AUM por nivel CENEPRED). Sin N/D. Con selector
+// "Desglosar por empresa". Porcentajes por sector/empresa suman 100% (denominador
+// = AUM del sector o de la empresa). Fila final "AUM Total" = cuota del sector en
+// cada categoría respecto a TODA la cartera (numerador sector / denominador cartera).
 function buildTbl3(hz, filtroEmisor, filtroSector){
   const wrap=document.getElementById('tbl3_'+hz.key);
   if(!wrap) return;
   const col=hz.col;
-  const ck=classKey();
-  const denom=(typeof AUM_MAP!=='undefined' ? (AUM_MAP[ck]||1) : (AUM[ck]||1));
-  const sectoresDisp = filtroSector
-    ? [filtroSector]
-    : [...new Set(Object.values(EMP_SECTOR).filter(Boolean))].sort();
-  let html='';
-  const niveles=[1,2,3,4,5,'N/D'];
-  sectoresDisp.forEach(sec=>{
-    const bucket={}; niveles.forEach(L=>bucket[L]=0);
-    D.forEach(d=>{
-      (d.ap||[]).forEach(a=>{
-        if(EMP_SECTOR[a.e]!==sec) return;
-        if(filtroEmisor && a.e!==filtroEmisor) return;
-        const m=a.m*classFrac(a.e);
-        if(m<=0) return;
-        const L=d[col];
-        const key=[1,2,3,4,5].indexOf(L)>=0 ? L : 'N/D';
-        bucket[key]+=m;
-      });
+  const niveles=[1,2,3,4,5];
+  const desglosar=!!DESGLOSE_TBL3[hz.key];
+
+  // dinero con score válido (sin N/D) por nivel: cartera total, por sector y por empresa
+  const portCat={}; niveles.forEach(L=>portCat[L]=0);
+  const secCat={}, compCat={};
+  D.forEach(d=>{
+    const L=d[col];
+    if(niveles.indexOf(L)<0) return;          // sin N/D
+    (d.ap||[]).forEach(a=>{
+      const m=a.m*classFrac(a.e); if(m<=0) return;
+      const sec=EMP_SECTOR[a.e]||a.s||'(sin sector)';
+      portCat[L]+=m;
+      (secCat[sec]=secCat[sec]||{})[L]=(secCat[sec][L]||0)+m;
+      const cc=(compCat[sec]=compCat[sec]||{});
+      (cc[a.e]=cc[a.e]||{})[L]=(cc[a.e][L]||0)+m;
     });
-    const totalSec=Object.values(bucket).reduce((s,v)=>s+v,0);
-    if(totalSec<=0) return;
+  });
+
+  const sectoresDisp = filtroSector ? [filtroSector]
+    : [...new Set(Object.values(EMP_SECTOR).filter(Boolean))].sort();
+  const pc=(num,den)=> den>0 ? (num/den*100).toLocaleString('es-PE',{maximumFractionDigits:1})+'%' : '—';
+
+  let html='<label class="tbl3-chk"><input type="checkbox" '+(desglosar?'checked':'')+
+           ' onchange="toggleDesglose(\''+hz.key+'\',this.checked)"> Desglosar por empresa</label>';
+
+  sectoresDisp.forEach(sec=>{
+    const sc=secCat[sec]; if(!sc) return;
+    const secTot=niveles.reduce((s,L)=>s+(sc[L]||0),0);
+    if(secTot<=0) return;
     html+='<div class="tbl3-titulo">'+sec+'</div>';
     html+='<table class="tbl3"><thead><tr><th class="idx">Riesgo</th>';
     niveles.forEach(L=>{ html+='<th>'+L+'</th>'; });
-    html+='</tr></thead><tbody><tr><td class="idx">AUM Total</td>';
-    niveles.forEach(L=>{
-      const v=bucket[L];
-      const pct = denom>0 ? (v/denom*100).toLocaleString('es-PE',{maximumFractionDigits:1})+'%' : '—';
-      html+='<td>'+pct+'</td>';
-    });
+    html+='</tr></thead><tbody>';
+    if(!desglosar){
+      html+='<tr><td class="idx">AUM '+sec+'</td>';
+      niveles.forEach(L=>{ html+='<td>'+pc(sc[L]||0, secTot)+'</td>'; });
+      html+='</tr>';
+    } else {
+      const comps=compCat[sec]||{};
+      Object.keys(comps).sort().forEach(emp=>{
+        const cc=comps[emp];
+        const compTot=niveles.reduce((s,L)=>s+(cc[L]||0),0);
+        if(compTot<=0) return;
+        html+='<tr><td class="idx">'+emp+'</td>';
+        niveles.forEach(L=>{ html+='<td>'+pc(cc[L]||0, compTot)+'</td>'; });
+        html+='</tr>';
+      });
+    }
+    // fila final SIEMPRE: AUM del sector en cat L / AUM de toda la cartera en cat L
+    html+='<tr class="tbl3-total"><td class="idx">AUM Total</td>';
+    niveles.forEach(L=>{ html+='<td>'+pc(sc[L]||0, portCat[L]||0)+'</td>'; });
     html+='</tr></tbody></table>';
   });
+
   wrap.innerHTML = html || '<p style="font-size:11px;color:var(--plomo)">Sin exposición para este filtro.</p>';
 }
 
@@ -5514,9 +5787,6 @@ function initControles(){
 document.getElementById('fxLbl').textContent =
   'S/ '+(FX.valor||3.5).toFixed(4)+' / US$'+(FX.fuente==='default'?' (default)':'');
 document.getElementById('gen').textContent='Generado '+PAYLOAD.generado;
-// CAMBIO 3: toggle para ocultar/mostrar las filas N/D (aditivo)
-const chkND=document.getElementById('chkND');
-if(chkND){ chkND.onchange=()=>document.body.classList.toggle('ocultar-nd', !chkND.checked); }
 document.getElementById('footgen').innerHTML=
   'Última actualización automática: <b>'+PAYLOAD.generado+'</b>';
 
