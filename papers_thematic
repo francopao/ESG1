@@ -1,0 +1,41 @@
+Buena pregunta — antes de ejecutar conviene saber dónde está la señal. Déjame revisar un par de papers del proyecto que aún no había explorado a fondo, para no rankear solo lo que ya leí.Listo. Revisado todo, acá va mi ranking. El criterio de ordenamiento no es "calidad académica" en abstracto, sino **cuánto mueve la aguja en la decisión concreta de tu proyecto**: ¿sirve o no el temático para una AFP, y cómo se integra? Marco cuáles ya tienes y cuáles no.
+
+**1. Bai, Tang, Wan & Yuksel — *Thematic Concentration and Mutual Fund Performance* (2024)** · *[En el proyecto]*
+El paper más importante de toda la biblioteca para tu pregunta central. Es la mejor evidencia empírica de **dónde vive realmente el alpha temático**: en la selección activa basada en holdings (+4.26% anual de alpha Carhart), no en el tema ni en el timing. Te da el método (TCI) y el veredicto. Potencia Módulos 1, 4 y 5.
+
+**2. Blitz — *Betting Against Quant: Examining the Factor Exposures of Thematic Indices* (Robeco, 2021)** · *[En el proyecto]*
+El contrapunto escéptico indispensable. Demuestra que los *índices* temáticos tienen exposición factorial estructuralmente negativa (subperformance esperada de ~3.9–5.6% anual). Es el paper que te protege de comprar factor drag disfrazado de innovación. Lo necesitas para el Módulo 1 y para la due diligence de cualquier vehículo.
+
+**3. Somefun, Perchet, Yin & Leote de Carvalho — *Allocating to Thematic Investments* (Financial Analysts Journal, 2023)** · *[En el proyecto]*
+La columna vertebral del Módulo 3. Es el framework de allocation a nivel SAA: descompone el tema en activos tradicionales + factores + residual específico, vía optimización robusta. Publicado en FAJ (revisión por pares seria), lo cual le da peso ante un comité.
+
+**4. *Thematic Investing as Missing Factors* (2026)** · *[En el proyecto]*
+El tratamiento más riguroso y reciente desde *asset pricing*. Reconceptualiza los temas como "factores faltantes/débiles" en los modelos de riesgo de los proveedores, y propone aislar la exposición temática *pura* del beta de mercado/industria/estilo. Es la base teórica que conecta tus Módulos 4 y 5. Sofisticado y actual.
+
+**5. MSCI — *Indexing Change: Understanding MSCI Thematic Indexes* (2019)** · *[En el proyecto]*
+El "plumbing" operativo. Introduce el *relevance score* (NLP sobre filings) que habilita medir exposición temática implícita y hacer **atribución estilo Brinson**. Es la referencia metodológica de los Módulos 4 y 5, y la fuente definicional más limpia para distinguir temático de factor/ESG.
+
+**6. *Detecting Exuberance Phenomena in Thematic Investing*** · *[En el proyecto]*
+La evidencia de riesgo que un comité conservador necesita ver: 10 de 11 índices temáticos MSCI mostraron burbujas detectables que reventaron al subir las tasas, mientras el índice padre no. Te da el test de exuberancia para el scorecard del Módulo 2 y la señal de salida del Módulo 5.
+
+**7. Methling & von Nitzsch — *Thematic Portfolio Optimization: Challenging the Core Satellite Approach*** · *[En el proyecto]*
+El paper que demuestra por qué el core-satellite ingenuo es subóptimo (hasta ~6–47% de mejora desperdiciada al ignorar correlaciones cruzadas). Directo al corazón del Módulo 3 cuando decidas la forma de integración.
+
+**8. Ben-David, Franzoni, Kim & Moussawi — *Competition for Attention in the ETF Space* (Journal of Finance, 2023)** · *[NO en el proyecto — recomiendo adquirir]*
+Es el respaldo empírico del *launch effect* que tus papers solo citan de pasada (Blitz lo referencia). Muestra que los ETFs especializados/temáticos se lanzan tras desempeño y hype fuertes y **rinden mal después** (subperformance del orden de ~–6% anual post-lanzamiento). Es la pieza dura que faltaba para sustentar la postura escéptica ante el comité. Publicado en el *Journal of Finance* — máxima credibilidad.
+
+**9. Kacperczyk, Sialm & Zheng — *On the Industry Concentration of Actively Managed Equity Mutual Funds* (Journal of Finance, 2005)** · *[NO en el proyecto — recomiendo adquirir]*
+El abuelo metodológico de todo el enfoque "concentración como habilidad". El TCI de Bai et al. (tu #1) se construye explícitamente en su espíritu (el ICI). Si vas a defender que la concentración temática puede ser señal de skill, este es el cimiento académico.
+
+**10. Morningstar — *Global Thematic Funds Landscape 2025*** · *[En el proyecto]*
+El reality-check de mercado. Datos de AUM, flujos, dispersión de desempeño y **mortalidad de fondos** temáticos. Imprescindible para el Módulo 6: nada calma a un comité conservador como mostrar cuántos fondos temáticos cierran y qué pasa con los flujos cuando el hype se va.
+
+---
+
+Tres notas para tu mandato específico:
+
+- **Sesgo deliberado del ranking:** los puestos 1–2 y 6, 8 son el "par escéptico" (alpha real vs factor drag vs burbuja vs launch effect). Esa tensión *es* tu framework. Si solo lees los papers optimistas de allocation, sales con un sesgo de venta.
+- **Para tu exposición a renta fija y privados** (que el top 10 cubre poco, porque la literatura central es de equity): vale la pena tener a mano *Bringing Sustainable Thematic Investing to Fixed Income* y *Thematic Investing With Big Data: The Case of Private Equity*, ambos en el proyecto. No entran al top 10 por relevancia al núcleo conceptual, pero sí a tu mandato.
+- **Mención honorable** para el *Big Book of Trends* (Robeco) como el mejor *toolkit* práctico de evaluación de temas (Hype Cycle, criterios de investibilidad), y para *Responsible or Thematic?* si necesitas separar formalmente ESG de temático.
+
+¿Quieres que arranquemos con alguno de los tres entregables que te propuse (deck del Módulo 6, verificación de límites SBS/SPP, o la Thematic Exposure Matrix piloto)?
