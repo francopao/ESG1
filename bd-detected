@@ -1,53 +1,779 @@
-# ============================================================
-#  setup_task_scheduler.ps1
-#  Registra la tarea en el Programador de Tareas de Windows
-#  para ejecutar BD_Equity_Research.py a las 09:00 y 15:00
+# =============================================================================
+#  BD_Equity_Research.py
+#  Alerta automatica de nuevas publicaciones para el modelo Bottom-Up RVL
+#  AFP Integra | Renta Variable Local / ESG & Physical Risks
+# =============================================================================
 #
-#  INSTRUCCIONES:
-#    1. Abre PowerShell como Administrador
-#    2. Ejecuta:  .\setup_task_scheduler.ps1
-#    3. Verifica en: Inicio → "Programador de tareas" → busca "BD_EquityResearch"
-# ============================================================
+#  SECTORES MONITOREADOS:
+#    1. Mining     → MINEM (Inversión, Producción, Boletín)
+#    2. Financial  → SBS   (EGP, Indicadores, Créditos)
+#    3. Consumo    → BBVA Research
+#    4. Construction → INE Chile (IPI) + OSITRAN Perú
+#
+#  LÓGICA GENERAL (igual para los 4 sectores):
+#    a) Scraping de la web fuente
+#    b) Comparar con el histórico guardado en Excel
+#    c) Si hay filas nuevas → guardar Excel actualizado + enviar correo HTML
+#    d) Si no hay cambios  → no hacer nada
+#
+#  PROGRAMACION (Task Scheduler):
+#    Ejecutar run_BD_EquityResearch.bat todos los días a las 09:00 y 15:00
+#
+# =============================================================================
 
-# ── Configura aquí tus rutas ─────────────────────────────────
-$NombreTarea  = "AFP_Integra_BD_EquityResearch"
-$RutaBat      = "Z:\Mesa de Inversiones\Bottom-Up\Franco\run_BD_EquityResearch.bat"
-$UsuarioPC    = $env:USERNAME          # toma automáticamente tu usuario de Windows
 
-# ── Acciones ─────────────────────────────────────────────────
-$accion = New-ScheduledTaskAction `
-    -Execute "cmd.exe" `
-    -Argument "/c `"$RutaBat`""
+# ─────────────────────────────────────────────────────────────────────────────
+#  0. IMPORTS
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Disparadores: 09:00 y 15:00, todos los días laborables ───
-$trigger09 = New-ScheduledTaskTrigger `
-    -Daily -At "09:00AM"
+import os
+import re
+import time
+import urllib.parse
+from datetime import datetime
 
-$trigger15 = New-ScheduledTaskTrigger `
-    -Daily -At "03:00PM"
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
-# ── Configuración de la tarea ─────────────────────────────────
-$configuracion = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
-    -MultipleInstances IgnoreNew `
-    -StartWhenAvailable `       # si la PC estaba apagada, ejecuta al encenderse
-    -WakeToRun:$false
+import win32com.client as win32
 
-# ── Registrar ─────────────────────────────────────────────────
-Register-ScheduledTask `
-    -TaskName    $NombreTarea `
-    -Action      $accion `
-    -Trigger     $trigger09, $trigger15 `
-    -Settings    $configuracion `
-    -RunLevel    Highest `
-    -Force `
-    -Description "Alerta automatica de nuevas publicaciones BD Equity Research - AFP Integra RVL"
 
-Write-Host ""
-Write-Host "✅ Tarea '$NombreTarea' registrada correctamente." -ForegroundColor Green
-Write-Host "   Horarios: 09:00 y 15:00 todos los dias." -ForegroundColor Cyan
-Write-Host ""
-Write-Host "Para verificar:" -ForegroundColor Yellow
-Write-Host "  taskschd.msc  →  Biblioteca del Programador de Tareas" -ForegroundColor Yellow
-Write-Host "  O ejecuta en PowerShell:" -ForegroundColor Yellow
-Write-Host "  Get-ScheduledTask -TaskName '$NombreTarea' | Get-ScheduledTaskInfo" -ForegroundColor Yellow
+# ─────────────────────────────────────────────────────────────────────────────
+#  1. CONFIGURACIÓN CENTRAL  ← EDITAR AQUÍ Y SOLO AQUÍ
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Correos ──────────────────────────────────────────────────────────────────
+CORREO_REMITENTE = "franco.olivares@sura.pe"          # Tu correo (Outlook)
+
+CORREOS_TO = [                                        # Destinatarios principales
+    "franco.olivares@sura.pe",
+    "rodrigo.murrieta@sura.pe",
+]
+
+CORREOS_CC = [                                        # Con copia (dejar vacío [] si no aplica)
+    "franco.olivares@sura.pe",
+]
+
+# ── Firma del correo ──────────────────────────────────────────────────────────
+FIRMA_NOMBRE    = "Franco Olivares"
+FIRMA_CARGO     = "Practicante de Inversiones"
+FIRMA_EMPRESA   = "AFP Integra"
+FIRMA_DIRECCION = "Av. Canaval y Moreyra 522 Piso 6 | Lima, Perú"
+FIRMA_WEB       = "www.afpintegra.pe"
+LOGO_PATH       = r"Z:\Mesa de Inversiones\Bottom-Up\Franco\logo_correo_integra.png"
+
+# ── Rutas de archivos históricos ─────────────────────────────────────────────
+BASE_DIR = (
+    r"\\sppeapp00023\Inversiones\Mesa de Inversiones\Bottom-Up"
+    r"\1 Proceso de Inversión Renta Variable\Proyecto Inputs Macro\Alerta BD"
+)
+
+RUTA_MINING       = os.path.join(BASE_DIR, "Mining Alert.xlsx")
+RUTA_FINANCIAL    = os.path.join(BASE_DIR, "Financial Alert.xlsx")
+RUTA_CONSUMO      = os.path.join(BASE_DIR, "Consumo Alert.xlsx")
+RUTA_CONSTRUCTION = os.path.join(BASE_DIR, "Construction Alert.xlsx")
+
+# ── Selenium / Chrome ─────────────────────────────────────────────────────────
+CHROMEDRIVER_PATH = (
+    r"Z:\Mesa de Inversiones\Bottom-Up\Practis\Drivers\chromedriver.exe"
+)
+
+# ── Headers web ───────────────────────────────────────────────────────────────
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  2. FUNCIONES COMPARTIDAS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detectar_nuevos(df_nuevo: pd.DataFrame,
+                    df_viejo: pd.DataFrame | None,
+                    nombre_fuente: str) -> pd.DataFrame:
+    """
+    Compara df_nuevo con df_viejo usando las columnas comunes.
+    Devuelve sólo las filas que son nuevas (left_only en el merge outer).
+    Agrega la columna 'fuente' con nombre_fuente.
+    """
+    if df_viejo is None or df_viejo.empty:
+        df_nuevas = df_nuevo.copy()
+    else:
+        cols = list(set(df_nuevo.columns) & set(df_viejo.columns))
+        nuevo_str = df_nuevo[cols].astype(str)
+        viejo_str = df_viejo[cols].astype(str)
+
+        merged = nuevo_str.merge(viejo_str, how="outer", indicator=True)
+        df_nuevas = (
+            merged[merged["_merge"] == "left_only"]
+            .drop(columns="_merge")
+            .reset_index(drop=True)
+        )
+
+    if not df_nuevas.empty:
+        df_nuevas["fuente"] = nombre_fuente
+        print(f"\n🚨 ALERTA [{nombre_fuente}]: {len(df_nuevas)} fila(s) nueva(s)")
+        print(df_nuevas.to_string(index=False))
+    else:
+        print(f"\n✅ [{nombre_fuente}]: sin cambios")
+
+    return df_nuevas
+
+
+def leer_historico(ruta: str, sheet_name=0) -> pd.DataFrame | None:
+    """Lee el Excel histórico. Devuelve None si no existe o falla la lectura."""
+    if not os.path.exists(ruta):
+        print(f"📁 Primera ejecución – no existe histórico: {os.path.basename(ruta)}")
+        return None
+    try:
+        df = pd.read_excel(ruta, sheet_name=sheet_name, engine="openpyxl")
+        print(f"📂 Histórico cargado: {os.path.basename(ruta)}")
+        return df
+    except Exception as exc:
+        print(f"⚠️  Error leyendo histórico ({os.path.basename(ruta)}): {exc}")
+        return None
+
+
+def construir_tabla_html(filas: list[dict]) -> str:
+    """
+    Recibe lista de dicts con claves: fuente, fecha, titulo, link (opcionales).
+    Devuelve una tabla HTML estilizada para el cuerpo del correo.
+    """
+    estilos_tabla = (
+        "border-collapse:collapse; width:100%; font-family:Calibri,Arial,sans-serif;"
+        "font-size:13px;"
+    )
+    estilos_th = (
+        "background:#1F4E79; color:#FFFFFF; padding:8px 12px;"
+        "text-align:left; font-weight:bold;"
+    )
+    estilos_td = "padding:7px 12px; border-bottom:1px solid #D9D9D9;"
+    estilos_td_alt = "padding:7px 12px; border-bottom:1px solid #D9D9D9; background:#F2F7FB;"
+
+    html = f'<table style="{estilos_tabla}">\n'
+    html += "  <thead><tr>\n"
+    for col in ["Fuente", "Fecha", "Título", "Link"]:
+        html += f'    <th style="{estilos_th}">{col}</th>\n'
+    html += "  </tr></thead>\n  <tbody>\n"
+
+    for i, fila in enumerate(filas):
+        td = estilos_td_alt if i % 2 else estilos_td
+        fuente = fila.get("fuente", "—")
+        fecha  = fila.get("fecha",  "—")
+        titulo = fila.get("titulo", "—") or "—"
+        link   = fila.get("link",   "") or ""
+        link_html = f'<a href="{link}" style="color:#0563C1;">Ver publicación</a>' if link else "—"
+        html += f"  <tr>\n"
+        html += f'    <td style="{td}">{fuente}</td>\n'
+        html += f'    <td style="{td}">{fecha}</td>\n'
+        html += f'    <td style="{td}">{titulo}</td>\n'
+        html += f'    <td style="{td}">{link_html}</td>\n'
+        html += "  </tr>\n"
+
+    html += "  </tbody>\n</table>\n"
+    return html
+
+
+def construir_firma_html() -> str:
+    """Devuelve el bloque HTML de la firma corporativa."""
+    return f"""
+<br>
+<p style="font-family:Calibri,Arial,sans-serif; font-size:13px; margin:0;">
+  <span style="color:#1F4E79; font-weight:bold;">{FIRMA_NOMBRE}</span><br>
+  <span style="color:#595959;">
+    {FIRMA_CARGO}<br>
+    {FIRMA_EMPRESA}<br>
+    {FIRMA_DIRECCION}
+  </span><br>
+  <a href="mailto:{CORREO_REMITENTE}" style="color:#0563C1;">{CORREO_REMITENTE}</a><br>
+  <a href="https://{FIRMA_WEB}" style="color:#0563C1;">{FIRMA_WEB}</a>
+</p>
+<img src="cid:logo_integra" style="margin-top:8px;">
+"""
+
+
+def enviar_correo_html(asunto: str, cuerpo_intro: str, filas_alertas: list[dict]) -> None:
+    """
+    Arma y envía un correo HTML con tabla de alertas y firma corporativa.
+
+    Parámetros:
+        asunto        – Línea de asunto del correo
+        cuerpo_intro  – Párrafo introductorio antes de la tabla
+        filas_alertas – Lista de dicts [{fuente, fecha, titulo, link}, ...]
+    """
+    tabla_html  = construir_tabla_html(filas_alertas)
+    firma_html  = construir_firma_html()
+
+    html_body = f"""
+<html><body style="font-family:Calibri,Arial,sans-serif; font-size:13px;">
+  <p>{cuerpo_intro}</p>
+  {tabla_html}
+  <p style="margin-top:12px;">Por favor revisar e incorporar en los insumos del modelo.</p>
+  {firma_html}
+</body></html>
+"""
+
+    outlook = win32.Dispatch("Outlook.Application")
+    mail    = outlook.CreateItem(0)
+
+    mail.To      = "; ".join(CORREOS_TO)
+    mail.CC      = "; ".join(CORREOS_CC)
+    mail.Subject = asunto
+    mail.HTMLBody = html_body
+
+    # Logo embebido
+    if os.path.exists(LOGO_PATH):
+        att = mail.Attachments.Add(LOGO_PATH)
+        att.PropertyAccessor.SetProperty(
+            "http://schemas.microsoft.com/mapi/proptag/0x3712001F",
+            "logo_integra"
+        )
+
+    mail.Send()
+    print("✅ Correo enviado correctamente")
+
+
+def filas_de_alertas(lista_dfs: list[pd.DataFrame]) -> list[dict]:
+    """Convierte lista de DataFrames de alertas en lista de dicts para la tabla."""
+    filas = []
+    for df in lista_dfs:
+        for _, row in df.iterrows():
+            filas.append({
+                "fuente": row.get("fuente", ""),
+                "fecha":  row.get("fecha",  ""),
+                "titulo": row.get("titulo", ""),
+                "link":   row.get("link",   ""),
+            })
+    return filas
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  3. MÓDULO MINING  (MINEM)
+# ─────────────────────────────────────────────────────────────────────────────
+#  Fuentes:
+#    - Boletín Estadístico Minero
+#    - Producción Minera
+#    - Inversión Minera
+
+def scrape_boletin_minero() -> pd.DataFrame:
+    """Boletín Estadístico Minero – gob.pe colecciones."""
+    url  = "https://www.gob.pe/institucion/minem/colecciones/6-boletin-estadistico-minero"
+    resp = requests.get(url, headers=HEADERS)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    contenedor = soup.find("div", class_="w-full js-official-documents-search-results")
+    items = contenedor.find_all("div", class_="col-md-6 py-2")
+
+    datos = []
+    for item in items:
+        card = item.find("div", class_=(
+            "p-4 shadow-campaign-card border-b-5 border-black h-full flex flex-col justify-between"
+        ))
+        if not card:
+            continue
+
+        fecha_tag = card.find("div", class_="border-b border-gray-700 pb-2 font-medium mb-3")
+        a_tag     = card.find("a", class_="leading-6 font-bold underline")
+        formatos  = card.find("div", class_="mt-3 leading-5 text-sm")
+
+        datos.append({
+            "fecha":       fecha_tag.get_text(strip=True) if fecha_tag else None,
+            "titulo":      a_tag.get_text(strip=True) if a_tag else None,
+            "link":        "https://www.gob.pe" + a_tag["href"] if a_tag else None,
+            "formatos":    formatos.get_text(strip=True) if formatos else None,
+        })
+
+    df = pd.DataFrame(datos)[["fecha", "titulo"]].dropna().reset_index(drop=True)
+    print(f"  📄 Boletín Minero: {len(df)} registros")
+    return df
+
+
+def scrape_produccion_minera() -> pd.DataFrame:
+    """Producción Minera – gob.pe informes-publicaciones."""
+    url  = "https://www.gob.pe/institucion/minem/informes-publicaciones/5472883-produccion-minera"
+    resp = requests.get(url, headers=HEADERS)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    contenedor = soup.find("div", class_="js-search-results")
+    cards = contenedor.find_all(
+        "div", class_="shadow-campaign-card flex-col border-1 border-blue-300"
+    )
+
+    datos = []
+    for card in cards:
+        h3       = card.find("h3", class_="text-base font-bold mb-4")
+        link_tag = card.find("a", class_="track-ga-click")
+        datos.append({
+            "fecha": h3.get_text(strip=True) if h3 else None,
+            "link":  link_tag["href"] if link_tag else None,
+        })
+
+    df = pd.DataFrame(datos).dropna(subset=["fecha"]).reset_index(drop=True)
+    print(f"  📄 Producción Minera: {len(df)} registros")
+    return df
+
+
+def scrape_inversion_minera() -> pd.DataFrame:
+    """Inversión Minera – gob.pe informes-publicaciones."""
+    url  = "https://www.gob.pe/institucion/minem/informes-publicaciones/3614950-inversion-minera"
+    resp = requests.get(url, headers=HEADERS)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    contenedor = soup.find("div", class_="js-search-results")
+    cards = contenedor.find_all(
+        "div", class_="shadow-campaign-card flex-col border-1 border-blue-300"
+    )
+
+    datos = []
+    for card in cards:
+        h3  = card.find("h3", class_="text-base font-bold mb-4")
+        btn = card.find("a", class_="btn btn--secondary download underline")
+        fb  = card.find("a", class_="track-ga-click underline")
+
+        link = None
+        if btn and btn.has_attr("href"):
+            link = btn["href"]
+        elif fb and fb.has_attr("href"):
+            link = fb["href"]
+
+        datos.append({
+            "fecha": h3.get_text(strip=True) if h3 else None,
+            "link":  link,
+        })
+
+    df = pd.DataFrame(datos).dropna(subset=["fecha"]).reset_index(drop=True)
+    print(f"  📄 Inversión Minera: {len(df)} registros")
+    return df
+
+
+def run_mining() -> None:
+    """Ejecuta el módulo completo de Mining."""
+    print("\n" + "="*60)
+    print("  MÓDULO MINING (MINEM)")
+    print("="*60)
+
+    # ── Scraping ──────────────────────────────────────────────────────────────
+    Mining = {
+        "Inversion":  scrape_inversion_minera(),
+        "produccion": scrape_produccion_minera(),
+        "boletin":    scrape_boletin_minero(),
+    }
+
+    # ── Leer histórico ────────────────────────────────────────────────────────
+    historico_raw = leer_historico(RUTA_MINING, sheet_name=None)   # dict de hojas
+    historico = historico_raw if isinstance(historico_raw, dict) else {}
+
+    # ── Detectar cambios ──────────────────────────────────────────────────────
+    map_nombres = {
+        "Inversion":  "Inversión Minera",
+        "produccion": "Producción Minera",
+        "boletin":    "Boletín Estadístico Minero",
+    }
+
+    lista_alertas = []
+    for key, df_nuevo in Mining.items():
+        df_viejo  = historico.get(key)
+        df_nuevas = detectar_nuevos(df_nuevo, df_viejo, map_nombres[key])
+        if not df_nuevas.empty:
+            lista_alertas.append(df_nuevas)
+
+    # ── Guardar Excel ─────────────────────────────────────────────────────────
+    if lista_alertas:
+        with pd.ExcelWriter(RUTA_MINING, engine="openpyxl") as writer:
+            for key, df_temp in Mining.items():
+                df_temp.to_excel(writer, sheet_name=key, index=False)
+        print("\n💾 Excel Mining actualizado")
+
+        # ── Correo ────────────────────────────────────────────────────────────
+        filas = filas_de_alertas(lista_alertas)
+        enviar_correo_html(
+            asunto="🚨 ACTUALIZAR BASE DE DATOS – MINING",
+            cuerpo_intro=(
+                "Se detectaron <b>nuevas publicaciones</b> en las fuentes MINEM "
+                "utilizadas en el Reporte BU de Mining:"
+            ),
+            filas_alertas=filas,
+        )
+    else:
+        print("\n⏸  Mining: sin cambios – no se envía correo")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  4. MÓDULO FINANCIAL  (SBS)
+# ─────────────────────────────────────────────────────────────────────────────
+#  Fuentes:
+#    - B-2201: EGP (Estado de Ganancias y Pérdidas)
+#    - B-2401: Indicadores Financieros
+#    - B-2309: Estructura de Créditos
+
+INDICADORES_SBS = {
+    "B-2201": "EGP",
+    "B-2401": "Indicadores",
+    "B-2309": "Creditos",
+}
+
+MESES_SBS = [
+    ("di", "Diciembre"), ("no", "Noviembre"), ("oc", "Octubre"),
+    ("se", "Setiembre"), ("ag", "Agosto"),    ("jl", "Julio"),
+    ("jn", "Junio"),     ("my", "Mayo"),      ("abr", "Abril"),
+    ("ma", "Marzo"),     ("fe", "Febrero"),   ("en", "Enero"),
+]
+
+MAP_NOMBRES_SBS = {
+    "EGP":        "Balance y EGP",
+    "Indicadores": "Indicadores Financieros",
+    "Creditos":   "Estructura de Créditos",
+}
+
+
+def url_sbs_existe(url: str) -> bool:
+    """Verifica si la URL SBS responde con 200."""
+    try:
+        r = requests.head(url, headers=HEADERS, timeout=5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def encontrar_ultimo_sbs(indicador: str) -> dict | None:
+    """
+    Recorre años (actual → actual-4) y meses (dic → ene)
+    hasta encontrar el archivo XLS más reciente en la SBS.
+    """
+    anio_actual = datetime.now().year
+    for anio in range(anio_actual, anio_actual - 5, -1):
+        for cod_mes, nombre_mes in MESES_SBS:
+            archivo = f"{indicador}-{cod_mes}{anio}.XLS"
+            url = (
+                f"https://intranet2.sbs.gob.pe/estadistica/financiera"
+                f"/{anio}/{nombre_mes}/{archivo}"
+            )
+            if url_sbs_existe(url):
+                return {
+                    "fecha":       f"{nombre_mes} {anio}",
+                    "titulo":      f"{indicador} – {nombre_mes} {anio}",
+                    "link":        url,
+                    "descripcion": f"{indicador} – {nombre_mes} {anio}",
+                }
+    return None
+
+
+def run_financial() -> None:
+    """Ejecuta el módulo completo de Financial (SBS)."""
+    print("\n" + "="*60)
+    print("  MÓDULO FINANCIAL (SBS)")
+    print("="*60)
+
+    # ── Scraping ──────────────────────────────────────────────────────────────
+    data_por_hoja = {}
+    for indicador, nombre_hoja in INDICADORES_SBS.items():
+        resultado = encontrar_ultimo_sbs(indicador)
+        if resultado:
+            data_por_hoja[nombre_hoja] = pd.DataFrame([resultado])
+            print(f"  📄 {nombre_hoja}: {resultado['fecha']}")
+        else:
+            data_por_hoja[nombre_hoja] = pd.DataFrame(
+                columns=["fecha", "titulo", "link", "descripcion"]
+            )
+            print(f"  ⚠️  {nombre_hoja}: no se encontró archivo")
+
+    # ── Leer histórico ────────────────────────────────────────────────────────
+    historico_raw = leer_historico(RUTA_FINANCIAL, sheet_name=None)
+    historico = historico_raw if isinstance(historico_raw, dict) else {}
+
+    # ── Detectar cambios ──────────────────────────────────────────────────────
+    lista_alertas = []
+    for hoja, df_nuevo in data_por_hoja.items():
+        df_viejo  = historico.get(hoja)
+        nombre_legible = MAP_NOMBRES_SBS.get(hoja, hoja)
+        df_nuevas = detectar_nuevos(df_nuevo, df_viejo, nombre_legible)
+        if not df_nuevas.empty:
+            lista_alertas.append(df_nuevas)
+
+    # ── Guardar Excel ─────────────────────────────────────────────────────────
+    if lista_alertas:
+        with pd.ExcelWriter(RUTA_FINANCIAL, engine="openpyxl") as writer:
+            for hoja, df in data_por_hoja.items():
+                df.to_excel(writer, sheet_name=hoja, index=False)
+        print("\n💾 Excel Financial actualizado")
+
+        # ── Correo ────────────────────────────────────────────────────────────
+        filas = filas_de_alertas(lista_alertas)
+        enviar_correo_html(
+            asunto="🚨 ACTUALIZAR FINANCIALS – NUEVA PUBLICACIÓN SBS",
+            cuerpo_intro=(
+                "Se detectaron <b>nuevas publicaciones</b> en la SBS "
+                "para actualizar la BD de Financials:"
+            ),
+            filas_alertas=filas,
+        )
+    else:
+        print("\n⏸  Financial: sin cambios – no se envía correo")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  5. MÓDULO CONSUMO  (BBVA Research)
+# ─────────────────────────────────────────────────────────────────────────────
+
+URL_BBVA = (
+    "https://www.bbvaresearch.com/buscador/"
+    "?dc:coverage@@@skos:prefLabel=Per%C3%BA@es"
+)
+FILTRO_TITULO_BBVA = "Perú | Seguimiento al consumo con datos en tiempo real"
+
+
+def scrape_bbva_consumo() -> pd.DataFrame:
+    """
+    Navega con Selenium a BBVA Research, hace scroll completo
+    y extrae cards de publicaciones sobre Perú.
+    """
+    service = Service(executable_path=CHROMEDRIVER_PATH)
+    options = webdriver.ChromeOptions()
+    options.add_argument("--start-maximized")
+    driver = webdriver.Chrome(service=service, options=options)
+
+    try:
+        driver.get(URL_BBVA)
+        time.sleep(5)
+
+        # Scroll infinito hasta llegar al fondo
+        last_height = driver.execute_script("return document.body.scrollHeight")
+        while True:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(3)
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                break
+            last_height = new_height
+
+        cards = driver.find_elements(By.CSS_SELECTOR, "article.shortcode_card")
+        print(f"  📄 BBVA Research: {len(cards)} cards encontrados")
+
+        datos = []
+        for card in cards:
+            try:
+                titulo = card.find_element(By.CSS_SELECTOR, "h3.cardTitulo").text
+                fecha  = card.find_element(By.CSS_SELECTOR, "p.cardFecha").text
+                link   = card.find_element(
+                    By.CSS_SELECTOR, "a.shortcode_card_container"
+                ).get_attribute("href")
+                datos.append({"fecha": fecha, "titulo": titulo, "link": link})
+            except Exception as exc:
+                print(f"    ⚠️  Error en card: {exc}")
+
+    finally:
+        driver.quit()
+
+    df = pd.DataFrame(datos)
+    return df
+
+
+def run_consumo() -> None:
+    """Ejecuta el módulo completo de Consumo (BBVA)."""
+    print("\n" + "="*60)
+    print("  MÓDULO CONSUMO (BBVA Research)")
+    print("="*60)
+
+    # ── Scraping + filtro ─────────────────────────────────────────────────────
+    df_bbva   = scrape_bbva_consumo()
+    df_nuevo  = df_bbva[
+        df_bbva["titulo"].str.startswith(FILTRO_TITULO_BBVA, na=False)
+    ].copy().reset_index(drop=True)
+    print(f"  📌 Registros filtrados (consumo): {len(df_nuevo)}")
+
+    # ── Leer histórico ────────────────────────────────────────────────────────
+    df_viejo = leer_historico(RUTA_CONSUMO)
+
+    # ── Detectar cambios ──────────────────────────────────────────────────────
+    df_nuevas = detectar_nuevos(df_nuevo, df_viejo, "Consumo BBVA")
+
+    # ── Guardar Excel ─────────────────────────────────────────────────────────
+    if not df_nuevas.empty:
+        df_nuevo.to_excel(RUTA_CONSUMO, index=False)
+        print("\n💾 Excel Consumo actualizado")
+
+        # ── Correo ────────────────────────────────────────────────────────────
+        filas = filas_de_alertas([df_nuevas])
+        enviar_correo_html(
+            asunto="🚨 NUEVA PUBLICACIÓN BIG DATA CONSUMO – BBVA Research",
+            cuerpo_intro=(
+                "Se detectaron <b>nuevas publicaciones</b> de BBVA Research "
+                "para la actualización de la BD Consumo:"
+            ),
+            filas_alertas=filas,
+        )
+    else:
+        print("\n⏸  Consumo: sin cambios – no se envía correo")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  6. MÓDULO CONSTRUCTION  (INE Chile + OSITRAN Perú)
+# ─────────────────────────────────────────────────────────────────────────────
+
+URL_INE_IPI = (
+    "https://www.ine.gob.cl/estadisticas-por-tema/"
+    "industria-energia-y-construccion/indice-de-produccion-industrial"
+)
+URL_OSITRAN = "https://www.ositran.gob.pe/anterior/publicaciones/boletin-estadistico/"
+
+FOLDER_INE = "fc62c4c1-8e79-4a42-bfc6-b37238816f98"   # ID carpeta boletines INE
+
+
+def scrape_ipi_chile() -> pd.DataFrame:
+    """
+    Navega el portal INE Chile con Selenium y extrae los links
+    de boletines del IPI del año actual.
+    """
+    driver = webdriver.Chrome()
+    wait   = WebDriverWait(driver, 15)
+
+    try:
+        driver.get(URL_INE_IPI)
+
+        # Abrir carpeta "Boletines"
+        boletines = wait.until(EC.element_to_be_clickable((
+            By.CSS_SELECTOR,
+            f'div.navPrincipalDescargas[data-folder="{FOLDER_INE}"]'
+        )))
+        boletines.click()
+
+        # Seleccionar año actual
+        anio_actual = str(datetime.now().year)
+        anio_elem = wait.until(EC.element_to_be_clickable((
+            By.XPATH,
+            f'//div[contains(@class,"categoriaDescarga") and text()="{anio_actual}"]'
+        )))
+        anio_elem.click()
+        time.sleep(2)
+
+        links = driver.find_elements(By.CSS_SELECTOR, "a.widArchNavArchivoDescarga")
+        hrefs = [lnk.get_attribute("href") for lnk in links]
+
+    finally:
+        driver.quit()
+
+    datos = []
+    for href in hrefs:
+        decoded = urllib.parse.unquote(href.lower())
+        match = re.search(
+            r"(enero|febrero|marzo|abril|mayo|junio|julio|agosto|"
+            r"septiembre|octubre|noviembre|diciembre)-(\d{4})",
+            decoded
+        )
+        fecha = f"{match.group(1)} {match.group(2)}" if match else None
+        datos.append({"titulo": "Índice de Producción Industrial", "fecha": fecha})
+
+    df = pd.DataFrame(datos)
+    print(f"  📄 IPI Chile: {len(df)} registros")
+    return df
+
+
+def scrape_ositran() -> pd.DataFrame:
+    """
+    Navega el portal OSITRAN con Selenium y extrae boletines del año actual.
+    """
+    driver = webdriver.Chrome()
+    wait   = WebDriverWait(driver, 15)
+
+    try:
+        driver.get(URL_OSITRAN)
+        anio_actual = str(datetime.now().year)
+
+        tab = wait.until(EC.element_to_be_clickable((
+            By.XPATH,
+            f'//ul[contains(@class,"nav-tabs")]//a[text()="{anio_actual}"]'
+        )))
+        tab.click()
+
+        wait.until(EC.presence_of_element_located((By.ID, f"tab-{anio_actual}")))
+        time.sleep(1)
+
+        elementos = driver.find_elements(
+            By.CSS_SELECTOR, f"#tab-{anio_actual} div.bole-item h2 a"
+        )
+
+        datos = []
+        for el in elementos:
+            titulo_raw = el.text
+            match = re.search(r"(\w+)\s(\d{4})", titulo_raw.lower())
+            fecha = f"{match.group(1)} {match.group(2)}" if match else None
+            datos.append({"titulo": "Boletín Estadístico OSITRAN", "fecha": fecha})
+
+    finally:
+        driver.quit()
+
+    df = pd.DataFrame(datos)
+    print(f"  📄 OSITRAN Perú: {len(df)} registros")
+    return df
+
+
+def run_construction() -> None:
+    """Ejecuta el módulo completo de Construction."""
+    print("\n" + "="*60)
+    print("  MÓDULO CONSTRUCTION (INE Chile + OSITRAN Perú)")
+    print("="*60)
+
+    # ── Scraping ──────────────────────────────────────────────────────────────
+    df_ipi     = scrape_ipi_chile()
+    df_ositran = scrape_ositran()
+
+    # ── Leer histórico ────────────────────────────────────────────────────────
+    ipi_viejo     = leer_historico(RUTA_CONSTRUCTION, sheet_name="IPI-Chile")
+    ositran_viejo = leer_historico(RUTA_CONSTRUCTION, sheet_name="OSITRAN-Peru")
+
+    # ── Detectar cambios ──────────────────────────────────────────────────────
+    nuevas_ipi     = detectar_nuevos(df_ipi,     ipi_viejo,     "IPI Chile")
+    nuevas_ositran = detectar_nuevos(df_ositran, ositran_viejo, "OSITRAN Perú")
+
+    lista_alertas = [df for df in [nuevas_ipi, nuevas_ositran] if not df.empty]
+
+    # ── Guardar Excel ─────────────────────────────────────────────────────────
+    if lista_alertas:
+        with pd.ExcelWriter(RUTA_CONSTRUCTION, engine="openpyxl") as writer:
+            df_ipi.to_excel(writer,     sheet_name="IPI-Chile",   index=False)
+            df_ositran.to_excel(writer, sheet_name="OSITRAN-Peru", index=False)
+        print("\n💾 Excel Construction actualizado")
+
+        # ── Correo ────────────────────────────────────────────────────────────
+        filas = filas_de_alertas(lista_alertas)
+        enviar_correo_html(
+            asunto="🚨 NUEVAS PUBLICACIONES BD CONSTRUCCIÓN",
+            cuerpo_intro=(
+                "Se detectaron <b>nuevas publicaciones</b> para la actualización "
+                "de la BD Construcción:"
+            ),
+            filas_alertas=filas,
+        )
+    else:
+        print("\n⏸  Construction: sin cambios – no se envía correo")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  7. MAIN  → ejecuta los 4 módulos en orden
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    inicio = datetime.now()
+    print(f"\n{'='*60}")
+    print(f"  BD Equity Research – Inicio: {inicio.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}")
+
+    run_mining()
+    run_financial()
+    run_consumo()
+    run_construction()
+
+    fin = datetime.now()
+    duracion = (fin - inicio).seconds
+    print(f"\n{'='*60}")
+    print(f"  BD Equity Research – Fin: {fin.strftime('%H:%M:%S')}  "
+          f"(duración: {duracion}s)")
+    print(f"{'='*60}\n")
