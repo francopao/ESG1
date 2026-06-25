@@ -1,0 +1,50 @@
+Perfecto, entonces son **dos cambios pequeños** y puntuales. Te los doy listos para pegar.
+
+## 1) En `buildTbl3` (JavaScript)
+
+Dentro del bloque `else { ... }` (el modo desglosado), justo después del `forEach` que pinta las empresas. Busca este final del `else`:
+
+```javascript
+        html+='<tr><td class="idx">'+emp+'</td>';
+        niveles.forEach(L=>{ html+='<td>'+pc(cc[L]||0, compTot)+'</td>'; });
+        html+='</tr>';
+      });
+    }
+```
+
+y reemplázalo por (lo único nuevo son las 4 líneas antes del `}`):
+
+```javascript
+        html+='<tr><td class="idx">'+emp+'</td>';
+        niveles.forEach(L=>{ html+='<td>'+pc(cc[L]||0, compTot)+'</td>'; });
+        html+='</tr>';
+      });
+      // Fila penúltima (solo desglosado): distribución del sector, mismo cálculo
+      // que la fila "AUM <sector>" del modo sin desglosar (denominador = secTot).
+      html+='<tr class="tbl3-sector"><td class="idx">AUM '+sec+'</td>';
+      niveles.forEach(L=>{ html+='<td>'+pc(sc[L]||0, secTot)+'</td>'; });
+      html+='</tr>';
+    }
+```
+
+Como va **dentro** del `else`, solo aparece al desglosar; el modo sin desglosar queda igual. Y como usa `sc[L]` con denominador `secTot` (ambos ya están en scope en ese `forEach(sec=>...)`), el cálculo es idéntico al de la fila "AUM {sector}" de arriba, y suma 100% a lo ancho.
+
+## 2) En el CSS (realce sutil)
+
+Busca estas dos líneas que ya tienes (el estilo de `AUM Total`):
+
+```css
+ table.tbl3 tr.tbl3-total td{background:#eef3ff;font-weight:700;color:var(--azul);}
+ table.tbl3 tr.tbl3-total td.idx{background:#dde6fb;}
+```
+
+y agrega justo debajo estas dos:
+
+```css
+ table.tbl3 tr.tbl3-sector td{background:#f4f7fd;font-weight:600;color:var(--azul);}
+ table.tbl3 tr.tbl3-sector td.idx{background:#e7eefb;}
+```
+
+Usé un azul **más claro** que el de `AUM Total` a propósito, para que quede una jerarquía visual: empresas (blanco) → **AUM {sector}** (azul muy tenue) → **AUM Total** (azul un poco más marcado). Si lo prefieres idéntico al de `AUM Total`, cambia esos dos colores por `#eef3ff` y `#dde6fb`.
+
+Eso es todo: una fila nueva en el `else` y dos líneas de CSS. No toca nada más del comportamiento.
