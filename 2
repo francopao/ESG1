@@ -1,0 +1,36 @@
+def load_geografia_bancos(path):
+    """Lee el resumen B-2358 y devuelve la geografía de créditos POR BANCO (sin
+    colapsar a emisor). Columna 'banco' = clave canónica (BANCO DE CREDITO, MIBANCO,
+    INTERBANK, BBVA, ...) y 'banco_n' su normalización para emparejar. El crédito pasa
+    a 'tmf' (peso de reparto); forma de 'producción' para reutilizar build_model."""
+    xl = pd.ExcelFile(path)
+    sheet = xl.sheet_names[0]
+    for s in xl.sheet_names:
+        if norm("RESUMEN") in norm(s):
+            sheet = s; break
+    raw = pd.read_excel(path, sheet_name=sheet, header=None)
+    hdr_row, _ = detect_header_row(
+        raw, ["Empresa", "Departamento", "Provincia", "Distrito"], max_scan=15)
+    df = pd.read_excel(path, sheet_name=sheet, header=hdr_row).dropna(axis=1, how="all")
+    cols = _resolver_columnas_por_nombre(df.columns, FIN_COLS,
+                                         "el resumen de bancos (créditos)")
+    df = df.rename(columns={cols["empresa"]: "titular", cols["depto"]: "depto",
+                            cols["prov"]: "prov", cols["dist"]: "dist", cols["monto"]: "acum"})
+    df = df[df["titular"].notna() & df["depto"].notna()].copy()
+    df["acum"] = pd.to_numeric(df["acum"], errors="coerce").fillna(0.0)
+    eq_norm = {norm(k): v for k, v in EQUIV_BANCOS_GEO.items()}
+    df["banco"] = df["titular"].apply(lambda t: eq_norm.get(norm(t)))
+    no_map = sorted(set(str(t).strip() for t in df.loc[df["banco"].isna(), "titular"].dropna()))
+    if no_map:
+        log("Bancos en el resumen NO mapeados (se omiten). Si alguno debe incluirse, "
+            "agrégalo a EQUIV_BANCOS_GEO en CONFIG:", "WARN")
+        for b in no_map:
+            log(f"      · '{b}'", "WARN")
+    df = df[df["banco"].notna()].copy()
+    df["banco_n"] = df["banco"].apply(norm)
+    df["mineral"] = "Créditos"; df["unidad"] = "Miles S/"
+    df["unidad_minera"] = None; df["unidad_norm"] = "credmiles"
+    df["factor"] = 1.0; df["tmf"] = df["acum"]
+    log(f"Geografía de bancos: {len(df)} filas de {df['banco'].nunique()} banco(s).")
+    return df[["mineral", "unidad", "titular", "unidad_minera", "depto", "prov",
+               "dist", "acum", "unidad_norm", "factor", "tmf", "banco", "banco_n"]]
