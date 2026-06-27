@@ -1,0 +1,43 @@
+HOLDINGS_SHEET_HINTS = ["Holdings", "Holding"]
+
+def load_holdings(risk_path):
+    """Control declarativo del sector financiero. Hoja 'Holdings' con columnas:
+    Emisor | Fuente | Banco | Hoja_Activos | AUM_Factor | [Sector].
+    Devuelve [{emisor, fuente('Banca'/'Hoja'), bancos:[...], hojas:[...], factor, sector}]."""
+    import openpyxl
+    wb = openpyxl.load_workbook(risk_path, read_only=True, data_only=True)
+    hoja = None
+    for h in HOLDINGS_SHEET_HINTS:
+        for s in wb.sheetnames:
+            if norm(h) in norm(s):
+                hoja = s; break
+        if hoja:
+            break
+    if hoja is None:
+        wb.close(); return []
+    rows = list(wb[hoja].iter_rows(min_row=1, values_only=True)); wb.close()
+    if not rows:
+        return []
+    head = [norm(c) for c in rows[0]]
+    def idx(*names):
+        for nm in names:
+            if norm(nm) in head:
+                return head.index(norm(nm))
+        return None
+    iE = idx("Emisor"); iF = idx("Fuente"); iB = idx("Banco", "Bancos")
+    iHA = idx("Hoja_Activos", "Hoja Activos"); iFac = idx("AUM_Factor", "AUM Factor", "Factor")
+    iS = idx("Sector")
+    out = []
+    for r in rows[1:]:
+        if iE is None or r[iE] is None:
+            continue
+        fuente = (str(r[iF]).strip() if iF is not None and r[iF] else "Banca")
+        bancos = [x.strip() for x in str(r[iB]).split(";")] if (iB is not None and r[iB]) else []
+        hojas = [x.strip() for x in str(r[iHA]).split(";")] if (iHA is not None and r[iHA]) else []
+        fac = _peso_a_decimal(r[iFac]) if (iFac is not None and r[iFac] is not None) else 1.0
+        out.append({"emisor": str(r[iE]).strip(),
+                    "fuente": ("Hoja" if norm(fuente).startswith("HOJA") else "Banca"),
+                    "bancos": bancos, "hojas": hojas,
+                    "factor": (fac if fac is not None else 1.0),
+                    "sector": (str(r[iS]).strip() if iS is not None and r[iS] else SECTOR_FINANCIERO)})
+    return out
