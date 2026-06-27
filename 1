@@ -1,25 +1,70 @@
-# --- Normalización de NOMBRES de banco del resumen B-2358 (lado GEOGRAFÍA) -------
-# Clave = nombre tal cual en la col "Empresa" del resumen; Valor = CLAVE CANÓNICA del
-# banco (su propia identidad), que usarás en la columna 'Banco' de la hoja 'Holdings'.
-# NO colapsa a emisor: un banco es una geografía física que uno o más emisores comparten.
-EQUIV_BANCOS_GEO = {
-    "BANCO DE CREDITO": "BANCO DE CREDITO",
-    "MIBANCO": "MIBANCO",
-    "INTERBANK": "INTERBANK",
-    "BBVA": "BBVA",
-}
-
-# --- Exposición (lado AUM/CLASE): cada emisor financiero toma SU PROPIO AUM y su
-# PROPIA clase (RV/RF) de 'Valorización', bajo su propio nombre. Clave = nombre en
-# col H; Valor = el mismo (no se suma ni se colapsa entre emisores).
-EQUIV_EXPOSICION_FINANCIERO = {
-    "Credicorp": "Credicorp",
-    "Banco de Crédito del Perú": "Banco de Crédito del Perú",
-    "Mibanco": "Mibanco",
-    "Interbank": "Interbank",
-    "Intercorp Perú": "Intercorp Perú",
-    "IFS": "IFS",
-    "BBVA": "BBVA",
-}
-# (EMPRESAS_FIN_CANONICAS y load_exposicion_financiero ya no se usan; puedes borrarlos
-#  cuando quieras. El universo financiero ahora sale de la hoja 'Holdings'.)
+def load_holdings(risk_path):
+    """Control declarativo del sector financiero. Hoja 'Holdings':
+    Emisor | Fuente | Banco | Hoja_Activos | AUM_Factor | [Sector].
+    Robusto a: dimensión mal grabada en modo read_only, fila de título sobre el
+    encabezado, y variantes de nombre de columna (espacios/mayúsculas/acentos)."""
+    import openpyxl
+    def _abrir(ro):
+        return openpyxl.load_workbook(risk_path, read_only=ro, data_only=True)
+    wb = _abrir(True)
+    hoja = None
+    for h in HOLDINGS_SHEET_HINTS:
+        for s in wb.sheetnames:
+            if norm(h) in norm(s):
+                hoja = s; break
+        if hoja:
+            break
+    if hoja is None:
+        log(f"Holdings: no se encontró ninguna hoja que contenga 'Holdings' en "
+            f"{os.path.basename(risk_path)}. Hojas: {wb.sheetnames}", "WARN")
+        wb.close(); return []
+    ws = wb[hoja]
+    try:
+        ws.reset_dimensions()      # corrige dimensión mal grabada (read_only)
+    except Exception:
+        pass
+    rows = [r for r in ws.iter_rows(values_only=True)]
+    wb.close()
+    # si read_only no devolvió datos utilizables, reintentar SIN read_only
+    if sum(1 for r in rows if any(c is not None for c in r)) < 2:
+        wb = _abrir(False); ws = wb[hoja]
+        rows = [r for r in ws.iter_rows(values_only=True)]; wb.close()
+    rows = [r for r in rows if any(c is not None for c in r)]
+    if not rows:
+        log(f"Holdings: la hoja '{hoja}' está vacía.", "WARN"); return []
+    # localizar la fila de encabezados (la que contenga 'Emisor')
+    hdr_i = None
+    for i, r in enumerate(rows[:8]):
+        if any("EMISOR" in norm(c) for c in r):
+            hdr_i = i; break
+    if hdr_i is None:
+        log(f"Holdings: en '{hoja}' no se halló encabezado con 'Emisor'. "
+            f"1ra fila: {rows[0]}", "WARN"); return []
+    head = [norm(c) for c in rows[hdr_i]]
+    def idx(*names):
+        for nm in names:
+            t = norm(nm)
+            for i, h in enumerate(head):
+                if t and t in h:       # subcadena (tolerante)
+                    return i
+        return None
+    iE = idx("Emisor"); iF = idx("Fuente"); iB = idx("Banco", "Bancos")
+    iHA = idx("Hoja_Activos", "Hoja Activos", "Hoja")
+    iFac = idx("AUM_Factor", "AUM Factor", "Factor"); iS = idx("Sector")
+    out = []
+    for r in rows[hdr_i + 1:]:
+        def cel(i):
+            return r[i] if (i is not None and i < len(r)) else None
+        if cel(iE) is None:
+            continue
+        fuente = (str(cel(iF)).strip() if cel(iF) else "Banca")
+        bancos = [x.strip() for x in str(cel(iB)).split(";")] if cel(iB) else []
+        hojas = [x.strip() for x in str(cel(iHA)).split(";")] if cel(iHA) else []
+        fac = _peso_a_decimal(cel(iFac)) if cel(iFac) is not None else 1.0
+        out.append({"emisor": str(cel(iE)).strip(),
+                    "fuente": ("Hoja" if norm(fuente).startswith("HOJA") else "Banca"),
+                    "bancos": bancos, "hojas": hojas,
+                    "factor": (fac if fac is not None else 1.0),
+                    "sector": (str(cel(iS)).strip() if cel(iS) else SECTOR_FINANCIERO)})
+    log(f"Holdings: hoja '{hoja}', {len(out)} renglón(es) leído(s).")
+    return out
