@@ -1,70 +1,139 @@
-def load_holdings(risk_path):
-    """Control declarativo del sector financiero. Hoja 'Holdings':
-    Emisor | Fuente | Banco | Hoja_Activos | AUM_Factor | [Sector].
-    Robusto a: dimensión mal grabada en modo read_only, fila de título sobre el
-    encabezado, y variantes de nombre de columna (espacios/mayúsculas/acentos)."""
-    import openpyxl
-    def _abrir(ro):
-        return openpyxl.load_workbook(risk_path, read_only=ro, data_only=True)
-    wb = _abrir(True)
-    hoja = None
-    for h in HOLDINGS_SHEET_HINTS:
-        for s in wb.sheetnames:
-            if norm(h) in norm(s):
-                hoja = s; break
-        if hoja:
-            break
-    if hoja is None:
-        log(f"Holdings: no se encontró ninguna hoja que contenga 'Holdings' en "
-            f"{os.path.basename(risk_path)}. Hojas: {wb.sheetnames}", "WARN")
-        wb.close(); return []
-    ws = wb[hoja]
-    try:
-        ws.reset_dimensions()      # corrige dimensión mal grabada (read_only)
-    except Exception:
-        pass
-    rows = [r for r in ws.iter_rows(values_only=True)]
-    wb.close()
-    # si read_only no devolvió datos utilizables, reintentar SIN read_only
-    if sum(1 for r in rows if any(c is not None for c in r)) < 2:
-        wb = _abrir(False); ws = wb[hoja]
-        rows = [r for r in ws.iter_rows(values_only=True)]; wb.close()
-    rows = [r for r in rows if any(c is not None for c in r)]
-    if not rows:
-        log(f"Holdings: la hoja '{hoja}' está vacía.", "WARN"); return []
-    # localizar la fila de encabezados (la que contenga 'Emisor')
-    hdr_i = None
-    for i, r in enumerate(rows[:8]):
-        if any("EMISOR" in norm(c) for c in r):
-            hdr_i = i; break
-    if hdr_i is None:
-        log(f"Holdings: en '{hoja}' no se halló encabezado con 'Emisor'. "
-            f"1ra fila: {rows[0]}", "WARN"); return []
-    head = [norm(c) for c in rows[hdr_i]]
-    def idx(*names):
-        for nm in names:
-            t = norm(nm)
-            for i, h in enumerate(head):
-                if t and t in h:       # subcadena (tolerante)
-                    return i
-        return None
-    iE = idx("Emisor"); iF = idx("Fuente"); iB = idx("Banco", "Bancos")
-    iHA = idx("Hoja_Activos", "Hoja Activos", "Hoja")
-    iFac = idx("AUM_Factor", "AUM Factor", "Factor"); iS = idx("Sector")
-    out = []
-    for r in rows[hdr_i + 1:]:
-        def cel(i):
-            return r[i] if (i is not None and i < len(r)) else None
-        if cel(iE) is None:
-            continue
-        fuente = (str(cel(iF)).strip() if cel(iF) else "Banca")
-        bancos = [x.strip() for x in str(cel(iB)).split(";")] if cel(iB) else []
-        hojas = [x.strip() for x in str(cel(iHA)).split(";")] if cel(iHA) else []
-        fac = _peso_a_decimal(cel(iFac)) if cel(iFac) is not None else 1.0
-        out.append({"emisor": str(cel(iE)).strip(),
-                    "fuente": ("Hoja" if norm(fuente).startswith("HOJA") else "Banca"),
-                    "bancos": bancos, "hojas": hojas,
-                    "factor": (fac if fac is not None else 1.0),
-                    "sector": (str(cel(iS)).strip() if cel(iS) else SECTOR_FINANCIERO)})
-    log(f"Holdings: hoja '{hoja}', {len(out)} renglón(es) leído(s).")
-    return out
+Nada de prototipo. Va directo a tu **dashboard de activos** (`Dashboard_Activos_Riesgo`), porque ahí ya viven `calcScores()`, `MITIGANTES`, `classFrac` y la plata-por-emisor del lado JS — así que **no se toca Python**, solo el template HTML de ese módulo. Déjame validar el JS por ejecución antes de dártelo (mi regla).El error es del harness (require crea otro scope); junto todo en un solo archivo y corro.Validado por ejecución (node, con los stubs reales de tu dashboard): el bubble arma 4 trazas + cuadrante de prioridad; el Pareto arma barras + línea acumulada + marca 80%, y el cálculo de concentración sale correcto (en el ejemplo, "80% en 5 de 8 emisores"). `riesgoPorEmisor()` calcula bien AUM mapeado, score class-aware y plata-en-riesgo por emisor.
+
+Dos definiciones que asumí (dímelo si quieres cambiarlas):
+- **Plata-en-riesgo = AUM mapeado del emisor × su score global ponderado** (la misma convención "exposición × score" que ya usas en el resto). 
+- **Mitigante: "Alto" = más protección (bueno)** por defecto, así la prioridad es *peligro alto + mitigación baja*. Como esa polaridad es ambigua, dejé un **check en el chart para invertirla** sin tocar código.
+
+Ambos charts **respetan la pestaña** (Resumen/RV/RF). Todo es JS sobre el payload que ya existe; **no se toca Python**. Cuatro pegues en el template `_HTML_TEMPLATE` del **módulo de activos** (el segundo del archivo, el que usa Leaflet):
+
+## Pegue 1 — Plotly (en el `<head>` de ese template)
+Busca la línea de Leaflet JS y **agrega Plotly justo debajo**:
+```html
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+```
+
+## Pegue 2 — HTML (en el `<body>`, entre `secScores` y la metodología)
+Busca `<div class="dos-cols" id="secScores"></div>` y **debajo** pega:
+```html
+  <div class="dos-cols" id="secEstrategia">
+    <div class="blk">
+      <h3><span class="dot" style="background:#c0392b"></span>Matriz Peligro × Mitigante</h3>
+      <p class="note">Cada burbuja es un emisor: vertical = peligro CENEPRED (score global ponderado por su plata), horizontal = nivel de mitigante, tamaño = AUM mapeado. La zona sombreada marca la prioridad (peligro alto + mitigación baja). Respeta la pestaña de clase.</p>
+      <label class="chk" style="margin-bottom:8px"><input type="checkbox" id="chkMitPol"> Interpretar Mitigante "Alto" = más riesgo residual (malo)</label>
+      <div id="bubbleMit" style="width:100%;height:520px"></div>
+    </div>
+    <div class="blk">
+      <h3><span class="dot" style="background:var(--azul)"></span>Concentración de la plata en riesgo</h3>
+      <p class="note">Emisores ordenados por plata-en-riesgo (AUM mapeado × score). La línea roja es el % acumulado: dice si el riesgo se concentra en pocos nombres o está disperso. Respeta la pestaña de clase.</p>
+      <div id="paretoRisk" style="width:100%;height:520px"></div>
+    </div>
+  </div>
+```
+
+## Pegue 3 — JS (antes del comentario `// ===…  CONTROLES`)
+Pega el bloque validado tal cual:
+```javascript
+// ======================================================================
+//  VISTA ESTRATÉGICA — A) Peligro × Mitigante  B) Concentración (Pareto)
+// ======================================================================
+let MIT_POLARIDAD = 'proteccion';        // 'proteccion' | 'residual'
+const MIT_NUM = {'Bajo':1,'Medio':2,'Alto':3};
+
+function riesgoPorEmisor(){
+  const scores = calcScores();           // score global por emisor (class-aware)
+  const aum = {};
+  D.forEach(d=>{ (d.ap||[]).forEach(a=>{
+    const m=a.m*classFrac(a.e); if(m>0) aum[a.e]=(aum[a.e]||0)+m; }); });
+  const out=[];
+  Object.keys(aum).forEach(e=>{
+    const sc = scores[e]? scores[e].global : 0;
+    out.push({emisor:e, sector:EMP_SECTOR[e]||'', aum:aum[e],
+              score:sc, plataRiesgo:aum[e]*sc, mit:getMitigante(e)});
+  });
+  return out;
+}
+function maxAum(datos){ return Math.max.apply(null,datos.map(r=>r.aum)); }
+
+let _mitPolWired=false;
+function buildEstrategia(){
+  if(!_mitPolWired){ const c=document.getElementById('chkMitPol');
+    if(c){ c.onchange=()=>{ MIT_POLARIDAD=c.checked?'residual':'proteccion'; buildBubbleMit(); };
+      _mitPolWired=true; } }
+  buildBubbleMit(); buildPareto();
+}
+
+function buildBubbleMit(){
+  const el=document.getElementById('bubbleMit'); if(!el) return;
+  const datos=riesgoPorEmisor().filter(r=>r.aum>0);
+  const sectores=[...new Set(datos.map(r=>r.sector))];
+  const jitter=()=> (Math.random()-0.5)*0.28;
+  const mx=maxAum(datos)||1;
+  const traces=sectores.map(sec=>{
+    const sub=datos.filter(r=>r.sector===sec);
+    return { type:'scatter', mode:'markers', name:sec||'(s/sector)',
+      x:sub.map(r=>(MIT_NUM[r.mit]||0)+jitter()),
+      y:sub.map(r=>r.score),
+      text:sub.map(r=>r.emisor),
+      customdata:sub.map(r=>[r.mit||'s/d', fmtMonto(r.aum), r.score.toFixed(2)]),
+      hovertemplate:'<b>%{text}</b><br>Mitigante: %{customdata[0]}'+
+        '<br>Peligro (score): %{customdata[2]}<br>AUM mapeado: %{customdata[1]}<extra>'+(sec||'')+'</extra>',
+      marker:{ size:sub.map(r=>Math.max(8,Math.min(46,8+34*Math.sqrt(r.aum/mx)))),
+               color:SEC_COLOR[sec]||'#555', line:{color:'#fff',width:1}, opacity:.82 } };
+  });
+  const xPel = (MIT_POLARIDAD==='proteccion') ? [-0.6,1.5] : [2.5,3.6];
+  const shapes=[{type:'rect',xref:'x',yref:'y',x0:xPel[0],x1:xPel[1],y0:3,y1:5.3,
+    fillcolor:'rgba(192,57,43,.08)',line:{width:0},layer:'below'}];
+  const anns=[{x:(xPel[0]+xPel[1])/2,y:5.15,xref:'x',yref:'y',
+    text:'Prioridad: peligro alto + mitigación baja',showarrow:false,
+    font:{size:11,color:'#c0392b'},xanchor:'center'}];
+  const layout={ margin:{l:54,r:18,t:14,b:54}, paper_bgcolor:'#fff', plot_bgcolor:'#fff',
+    hovermode:'closest', shapes, annotations:anns,
+    legend:{orientation:'h',y:-0.16,font:{size:10}},
+    xaxis:{title:{text:'Mitigante',font:{size:12,color:AFP.azul}}, range:[-0.7,3.7],
+      tickvals:[0,1,2,3], ticktext:['s/d','Bajo','Medio','Alto'], showgrid:false, zeroline:false},
+    yaxis:{title:{text:'Peligro CENEPRED (score global pond. 0–5)',font:{size:12,color:AFP.azul}},
+      range:[0,5.4], dtick:1, gridcolor:'#eef0f5', zeroline:false} };
+  Plotly.react('bubbleMit',traces,layout,{displayModeBar:false,responsive:true});
+}
+
+function buildPareto(){
+  const el=document.getElementById('paretoRisk'); if(!el) return;
+  let datos=riesgoPorEmisor().filter(r=>r.plataRiesgo>0).sort((a,b)=>b.plataRiesgo-a.plataRiesgo);
+  const total=datos.reduce((s,r)=>s+r.plataRiesgo,0)||1;
+  let acc=0; const cum=datos.map(r=>{acc+=r.plataRiesgo; return acc/total*100;});
+  let n80=cum.findIndex(v=>v>=80); n80=n80<0?datos.length:n80+1;
+  const x=datos.map(r=>r.emisor);
+  const bars={type:'bar',x:x,y:datos.map(r=>r.plataRiesgo),
+    marker:{color:datos.map(r=>SEC_COLOR[r.sector]||AFP.azul)}, yaxis:'y',
+    customdata:datos.map(r=>[r.sector, fmtMonto(r.aum), r.score.toFixed(2)]),
+    hovertemplate:'<b>%{x}</b> (%{customdata[0]})<br>Plata en riesgo: %{y:,.0f}'+
+      '<br>AUM mapeado: %{customdata[1]} · score %{customdata[2]}<extra></extra>'};
+  const line={type:'scatter',mode:'lines+markers',x:x,y:cum,yaxis:'y2',
+    line:{color:'#c0392b',width:2},marker:{size:5},
+    hovertemplate:'%{x}<br>Acumulado: %{y:.1f}%<extra></extra>'};
+  const shapes=[{type:'line',xref:'paper',yref:'y2',x0:0,x1:1,y0:80,y1:80,
+    line:{color:'#7E8083',width:1,dash:'dot'}}];
+  const anns=[{x:0.99,y:80,xref:'paper',yref:'y2',text:'80%',showarrow:false,
+    font:{size:10,color:'#7E8083'},xanchor:'right',yanchor:'bottom'},
+    {x:0.5,y:1.06,xref:'paper',yref:'paper',xanchor:'center',showarrow:false,
+     text:'El 80% de la plata-en-riesgo se concentra en '+n80+' de '+datos.length+' emisor(es)',
+     font:{size:11,color:AFP.azul}}];
+  const layout={margin:{l:62,r:54,t:30,b:96},paper_bgcolor:'#fff',plot_bgcolor:'#fff',
+    showlegend:false, shapes, annotations:anns, bargap:.3,
+    xaxis:{tickangle:-40,tickfont:{size:9},automargin:true},
+    yaxis:{title:{text:'Plata en riesgo (S/ × score)',font:{size:11,color:AFP.azul}},
+      gridcolor:'#eef0f5',zeroline:false},
+    yaxis2:{title:{text:'% acumulado',font:{size:11,color:'#c0392b'}},overlaying:'y',
+      side:'right',range:[0,105],zeroline:false,showgrid:false}};
+  Plotly.react('paretoRisk',[bars,line],layout,{displayModeBar:false,responsive:true});
+}
+```
+
+## Pegue 4 — refresco al cambiar pestaña/moneda
+Dentro de `redibujarTablas()`, busca la línea `if(typeof buildScoreSector==='function') buildScoreSector();` y **agrega debajo**:
+```javascript
+  if(typeof buildEstrategia==='function') buildEstrategia();
+```
+
+Con eso quedan los dos charts en el dashboard de activos, vivos con la clase activa y sin tocar el pipeline. Si prefieres que **plata-en-riesgo** sea "plata en zonas de nivel ≥3" en vez de "AUM × score", es un solo cambio en `riesgoPorEmisor`; dime y te lo doy.
