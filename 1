@@ -1,0 +1,25 @@
+# --- Normalización de NOMBRES de banco del resumen B-2358 (lado GEOGRAFÍA) -------
+# Clave = nombre tal cual en la col "Empresa" del resumen; Valor = CLAVE CANÓNICA del
+# banco (su propia identidad), que usarás en la columna 'Banco' de la hoja 'Holdings'.
+# NO colapsa a emisor: un banco es una geografía física que uno o más emisores comparten.
+EQUIV_BANCOS_GEO = {
+    "BANCO DE CREDITO": "BANCO DE CREDITO",
+    "MIBANCO": "MIBANCO",
+    "INTERBANK": "INTERBANK",
+    "BBVA": "BBVA",
+}
+
+# --- Exposición (lado AUM/CLASE): cada emisor financiero toma SU PROPIO AUM y su
+# PROPIA clase (RV/RF) de 'Valorización', bajo su propio nombre. Clave = nombre en
+# col H; Valor = el mismo (no se suma ni se colapsa entre emisores).
+EQUIV_EXPOSICION_FINANCIERO = {
+    "Credicorp": "Credicorp",
+    "Banco de Crédito del Perú": "Banco de Crédito del Perú",
+    "Mibanco": "Mibanco",
+    "Interbank": "Interbank",
+    "Intercorp Perú": "Intercorp Perú",
+    "IFS": "IFS",
+    "BBVA": "BBVA",
+}
+# (EMPRESAS_FIN_CANONICAS y load_exposicion_financiero ya no se usan; puedes borrarlos
+#  cuando quieras. El universo financiero ahora sale de la hoja 'Holdings'.)
