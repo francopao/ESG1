@@ -1,0 +1,914 @@
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+AUDITORÍA / BACKTESTING DEL DASHBOARD DE RIESGOS FÍSICOS DE CARTERA
+================================================================================
+Uso en Spyder:
+  · Cada bloque "# %%" es una celda ejecutable con Ctrl+Enter.
+  · Corre las celdas en orden de arriba hacia abajo.
+  · La única línea que DEBES editar antes de empezar es BASE_DIR (celda CONFIG).
+================================================================================
+"""
+
+# %% ── IMPORTS ────────────────────────────────────────────────────────────────
+
+import os
+import sys
+import traceback
+import datetime as _dt
+import importlib.util
+
+# %% ── CONFIG  ←  EDITA ESTA CELDA ANTES DE CORRER CUALQUIER OTRA ────────────
+
+# Carpeta donde vive el script de producción
+BASE_DIR = r"."   # <-- reemplaza con la ruta real, p.ej. r"Z:\Riesgos\Scripts"
+
+MAIN_SCRIPT = os.environ.get(
+    "AUDIT_MAIN_SCRIPT",
+    os.path.join(BASE_DIR, "Dashboard_Physical_RIsk_-_24_06.py"))
+
+AUDIT_OUT = os.environ.get(
+    "AUDIT_OUT",
+    os.path.join(BASE_DIR,
+                 f"Auditoria_Riesgos_Fisicos_{_dt.datetime.now():%Y%m%d_%H%M}.xlsx"))
+
+# Si True, corre main() del script de producción (recomendado).
+# Si False, auditoría parcial con outputs ya generados.
+RUN_PIPELINE = os.environ.get("AUDIT_RUN_PIPELINE", "1") not in ("0", "false", "False")
+
+# Tolerancias para las reconciliaciones numéricas
+TOL_ABS = 1.0    # soles
+TOL_PCT = 0.1    # puntos porcentuales
+
+# Paleta AFP Integra
+AZUL   = "1E2E6E"
+CYAN   = "00AECB"
+AMAR   = "E3E829"
+GRIS   = "7E8083"
+GRISBG = "F1F3F8"
+
+print(f"Script de producción : {MAIN_SCRIPT}")
+print(f"Excel de auditoría   : {AUDIT_OUT}")
+print(f"Ejecutar pipeline    : {RUN_PIPELINE}")
+
+# %% ── REGISTRO (REC) ─────────────────────────────────────────────────────────
+# Estructura que almacena todo lo que interceptamos del pipeline en tiempo real.
+
+REC = {
+    "files":         [],    # (descripcion, path)
+    "ventana_meses": None,  # [(año, mes), ...]
+    "ventana_cols":  [],    # (etiqueta, n_cols, faltantes, fallback)
+    "build_model":   [],    # por sector: dict con df_assign, um, detalle
+    "exp_sector":    [],    # (etiqueta, {empresa: AUM})
+    "financiero_df": None,  # DataFrame del resumen de bancos
+    "fen_apoyo":     None,  # (fen_dep, categorias, region_dep)
+    "fen_tabla":     None,  # tabla_fen real
+    "exp_clase":     None,  # (exp_clase, aum_cartera)
+    "districts":     None,  # districts finales (post-merge)
+    "dash_fen":      None,  # kwargs de _generar_fen_chart
+    "dash_act":      None,  # kwargs de generar_dashboard_activos
+    "errores":       [],
+}
+
+
+def _norm(s):
+    import unicodedata
+    return "".join(
+        c for c in unicodedata.normalize("NFD", str(s))
+        if unicodedata.category(c) != "Mn"
+    ).lower().strip()
+
+
+print("REC inicializado ✓")
+
+# %% ── CARGA E INSTRUMENTACIÓN (MONKEYPATCHING) ───────────────────────────────
+# Envuelve las funciones clave del script de producción para capturar sus
+# entradas y salidas SIN alterar su comportamiento.
+
+def cargar_modulo(path):
+    spec = importlib.util.spec_from_file_location("dpr_audit", path)
+    mod  = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def instrumentar(mod):
+    """Cada wrapper llama al original y devuelve su resultado sin modificarlo."""
+
+    def wrap(nombre, recorder):
+        orig = getattr(mod, nombre, None)
+        if orig is None:
+            return
+        def envuelto(*a, **k):
+            res = orig(*a, **k)
+            try:
+                recorder(a, k, res)
+            except Exception as e:
+                REC["errores"].append(f"recorder {nombre}: {e}")
+            return res
+        setattr(mod, nombre, envuelto)
+
+    # --- archivos resueltos ---
+    def rec_find_file(a, k, res):
+        desc = a[2] if len(a) >= 3 else k.get("descripcion", "?")
+        REC["files"].append((str(desc), str(res)))
+    wrap("find_file", rec_find_file)
+
+    # --- ventana temporal ---
+    def rec_meses(a, k, res):
+        if REC["ventana_meses"] is None:
+            REC["ventana_meses"] = list(res)
+    wrap("_meses_semestre_anterior", rec_meses)
+
+    def rec_cols(a, k, res):
+        try:
+            cols, etq, faltan, fb = res
+            REC["ventana_cols"].append((str(etq), len(cols), list(faltan or []), bool(fb)))
+        except Exception:
+            pass
+    wrap("_cols_en_ventana", rec_cols)
+
+    # --- build_model: corazón del reparto producción -> AUM por distrito ---
+    def rec_build(a, k, res):
+        sector = (a[5] if len(a) >= 6 else k.get("sector", "?"))
+        exp    = (a[1] if len(a) >= 2 else k.get("exp", {})) or {}
+        try:
+            districts, df_assign, um, detalle, no_map, dfm = res
+        except Exception:
+            return
+        REC["build_model"].append({
+            "sector":    str(sector),
+            "exp":       dict(exp),
+            "df_assign": df_assign.copy() if df_assign is not None else None,
+            "um":        dict(um)      if isinstance(um,      dict) else {},
+            "detalle":   dict(detalle) if isinstance(detalle, dict) else {},
+            "n_no_map":  0 if no_map is None else len(no_map),
+        })
+    wrap("build_model", rec_build)
+
+    # --- exposición por sector ---
+    def rec_exp(a, k, res):
+        etq = (a[4] if len(a) >= 5 else k.get("etiqueta", "?"))
+        REC["exp_sector"].append((str(etq), dict(res or {})))
+    wrap("load_exposicion_sector", rec_exp)
+
+    # --- resumen financiero ---
+    def rec_fin(a, k, res):
+        try:
+            df, _ = res
+            REC["financiero_df"] = df.copy()
+        except Exception:
+            pass
+    wrap("load_financiero", rec_fin)
+
+    # --- FEN_Apoyo ---
+    def rec_fenap(a, k, res):
+        REC["fen_apoyo"] = res
+    wrap("load_fen_apoyo", rec_fenap)
+
+    def rec_fentab(a, k, res):
+        REC["fen_tabla"] = res
+    wrap("build_fen_table_data", rec_fentab)
+
+    # --- clase RV/RF + AUM de cartera ---
+    def rec_clase(a, k, res):
+        REC["exp_clase"] = res
+    wrap("load_exposicion_clase", rec_clase)
+
+    # --- districts finales ---
+    def rec_merge(a, k, res):
+        REC["districts"] = res
+    wrap("merge_sectores", rec_merge)
+
+    # --- argumentos de los dos dashboards de interés ---
+    def rec_fen(a, k, res):
+        REC["dash_fen"] = {"args": a, "kwargs": k}
+    wrap("_generar_fen_chart", rec_fen)
+
+    def rec_act(a, k, res):
+        REC["dash_act"] = {"args": a, "kwargs": k}
+    wrap("generar_dashboard_activos", rec_act)
+
+
+def ejecutar(mod):
+    """Corre main() del pipeline. Si aborta, devuelve lo capturado hasta ese punto."""
+    try:
+        mod.main()
+    except SystemExit as e:
+        REC["errores"].append(f"main() hizo sys.exit({e.code}).")
+    except Exception:
+        REC["errores"].append("main() lanzó excepción:\n" + traceback.format_exc())
+
+
+print("Funciones de instrumentación definidas ✓")
+
+# %% ── EJECUTAR PIPELINE DE PRODUCCIÓN ───────────────────────────────────────
+
+if not os.path.exists(MAIN_SCRIPT):
+    raise FileNotFoundError(
+        f"No se encuentra el script de producción:\n  {MAIN_SCRIPT}\n"
+        "Ajusta BASE_DIR en la celda CONFIG.")
+
+mod = cargar_modulo(MAIN_SCRIPT)
+print(f"Módulo cargado ✓  ({MAIN_SCRIPT})")
+
+if RUN_PIPELINE:
+    print("Instrumentando funciones...")
+    instrumentar(mod)
+    print("Ejecutando main() de producción...")
+    ejecutar(mod)
+    print(f"\nPipeline finalizado.")
+    print(f"  Sectores capturados : {len(REC['build_model'])}")
+    print(f"  Districts capturados: {len(REC['districts'] or [])}")
+    print(f"  Errores             : {len(REC['errores'])}")
+    if REC["errores"]:
+        print("\n⚠️  Avisos:")
+        for e in REC["errores"]:
+            print("  •", str(e)[:120])
+else:
+    print("RUN_PIPELINE=False → pipeline no ejecutado (auditoría parcial).")
+
+# %% ── RECÁLCULOS INDEPENDIENTES (RECONCILIACIÓN) ────────────────────────────
+# Recalculamos scores y regiones FEN desde cero para contrastar contra los
+# dashboards y dejar evidencia de que los números cuadran.
+
+def recompute_scores(districts, exp_clase):
+    """Score CENEPRED por emisor ponderado por plata distrital (réplica de calcScores())."""
+    tot, perd = {}, {}
+    for d in districts or []:
+        acc = {}
+        for a in d.get("aportes", []):
+            m = a.get("monto", 0) or 0
+            if m > 0:
+                acc[a["emisor"]] = acc.get(a["emisor"], 0) + m
+        for e, m in acc.items():
+            tot[e] = tot.get(e, 0) + m
+            perd.setdefault(e, []).append(
+                (d.get("score_mm"), d.get("score_inu"), d.get("score_seq"), m))
+    out = {}
+    for e, T in tot.items():
+        amm = ainu = aseq = 0.0
+        for mm, inu, seq, m in perd[e]:
+            f = (m / T) if T else 0
+            amm  += f * (mm  if isinstance(mm,  (int, float)) else 0)
+            ainu += f * (inu if isinstance(inu, (int, float)) else 0)
+            aseq += f * (seq if isinstance(seq, (int, float)) else 0)
+        out[e] = {
+            "mm":     round(amm,  2),
+            "inu":    round(ainu, 2),
+            "seq":    round(aseq, 2),
+            "global": round((amm + ainu + aseq) / 3, 2),
+        }
+    return out
+
+
+def recompute_region(districts, fen_dep, region_dep):
+    """AUM por (Región - Categoría) para la sección Regiones del dashboard FEN."""
+    grupos = {}
+    for d in districts or []:
+        depn = _norm(d.get("dep", ""))
+        reg  = (region_dep or {}).get(depn)
+        cat  = (fen_dep    or {}).get(depn)
+        if not reg or d.get("nivel") not in (1, 2, 3, 4, 5):
+            continue
+        label = f"{reg} - {cat}" if cat else reg
+        g = grupos.setdefault(label, {"aum": 0.0, "emp": {}})
+        for a in d.get("aportes", []):
+            m = a.get("monto", 0) or 0
+            if m <= 0:
+                continue
+            g["aum"] += m
+            acts = a.get("activos") or []
+            n    = len(acts) if acts else 1
+            e    = g["emp"].setdefault(a["emisor"], {"n": 0, "aum": 0.0})
+            e["n"]   += n
+            e["aum"] += m
+    return grupos
+
+
+print("Funciones de recálculo definidas ✓")
+
+# %% ── HELPERS DE MAPEO ───────────────────────────────────────────────────────
+
+districts = REC.get("districts") or []
+exp_clase = (REC["exp_clase"] or (None, None))[0] or {}
+
+# ubigeo -> (dep, prov, dist)
+u2name = {
+    d.get("ubigeo"): (d.get("dep"), d.get("prov"), d.get("dist"))
+    for d in districts
+}
+
+# emisor -> sector
+emp_sector = {}
+dargs = REC.get("dash_fen") or {}
+if dargs:
+    a = dargs.get("args", [])
+    if len(a) >= 6 and isinstance(a[5], dict):
+        emp_sector = a[5]
+if not emp_sector:
+    for d in districts:
+        for ap in d.get("aportes", []):
+            emp_sector.setdefault(ap["emisor"], ap.get("sector", ""))
+
+print(f"Distritos   : {len(districts)}")
+print(f"Emisores    : {len(emp_sector)}")
+print(f"build_model : {len(REC['build_model'])} sector(es)")
+
+# %% ── INICIALIZAR WORKBOOK Y ESTILOS ─────────────────────────────────────────
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+F_TIT  = Font(name="Calibri", size=15, bold=True,  color=AZUL)
+F_H2   = Font(name="Calibri", size=12, bold=True,  color=AZUL)
+F_HEAD = Font(name="Calibri", size=10, bold=True,  color="FFFFFF")
+F_BODY = Font(name="Calibri", size=10, color="1F2533")
+F_BOLD = Font(name="Calibri", size=10, bold=True,  color="1F2533")
+F_SUB  = Font(name="Calibri", size=9,  color=GRIS)
+
+FILL_HEAD = PatternFill("solid", fgColor=AZUL)
+FILL_SUB  = PatternFill("solid", fgColor=GRISBG)
+OK_FILL   = PatternFill("solid", fgColor="D4EDDA")
+BAD_FILL  = PatternFill("solid", fgColor="F8D7DA")
+WARN_FILL = PatternFill("solid", fgColor="FFF3CD")
+
+THIN   = Side(style="thin", color="DCDDDE")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+AL = Alignment(horizontal="left",   vertical="top",    wrap_text=True)
+AC = Alignment(horizontal="center", vertical="center")
+AR = Alignment(horizontal="right",  vertical="center")
+
+FMT_S = '#,##0;(#,##0);-'
+FMT_2 = '#,##0.00'
+FMT_P = '0.0%'
+
+wb = Workbook()
+
+
+def hoja(nombre):
+    ws = wb.create_sheet(nombre)
+    ws.sheet_view.showGridLines = False
+    return ws
+
+
+def headers(ws, row, cols, widths):
+    for j, t in enumerate(cols, 1):
+        c = ws.cell(row=row, column=j, value=t)
+        c.font = F_HEAD; c.fill = FILL_HEAD; c.alignment = AC; c.border = BORDER
+    for j, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(j)].width = w
+    ws.freeze_panes = ws.cell(row=row + 1, column=1)
+
+
+def fila(ws, row, vals, fmts=None, aligns=None, fills=None):
+    for j, v in enumerate(vals, 1):
+        c = ws.cell(row=row, column=j, value=v)
+        c.font = F_BODY; c.border = BORDER
+        c.alignment = (aligns[j - 1] if aligns else AL)
+        if fmts and fmts[j - 1]:
+            c.number_format = fmts[j - 1]
+        if fills and fills[j - 1]:
+            c.fill = fills[j - 1]
+
+
+print("Workbook y estilos inicializados ✓")
+
+# %% ── HOJA: PORTADA ──────────────────────────────────────────────────────────
+
+ws = wb.active
+ws.title = "Portada"
+ws.sheet_view.showGridLines = False
+
+ws["A1"] = "Auditoría del proceso de Riesgos Físicos de Cartera"
+ws["A1"].font = F_TIT
+ws["A2"] = f"Generado: {_dt.datetime.now():%Y-%m-%d %H:%M}  ·  AFP Integra — Mesa de Inversiones"
+ws["A2"].font = F_SUB
+
+intro = [
+    "",
+    "Qué valida este reporte:",
+    "  1. Origen de los datos: qué archivo, hoja y columnas alimentan cada pieza.",
+    "  2. Cantidades producidas asignadas a cada activo físico, y la regla de reparto del AUM.",
+    "  3. Cálculos de los dos dashboards: FEN y activos, con reconciliación independiente.",
+    "  4. Detalle del sector financiero (mapeo semestral de créditos).",
+    "",
+    "Cómo se construyó:",
+    "  Importa el script de producción y envuelve sus propias funciones para registrar",
+    "  entradas/salidas reales mientras corre main(). Lo auditado es exactamente lo que",
+    "  produce el proceso. Solo en las hojas de 'Verificación' recalculamos de forma",
+    "  independiente para dejar constancia de que los números cuadran.",
+    "",
+    "Metodología de reparto:",
+    "  El AUM de cada empresa se reparte entre los distritos donde tiene activos físicos,",
+    "  en proporción a una 'cantidad producida' (minería: TMF; utilities: potencia;",
+    "  construcción: despachos; financiero: créditos colocados). El riesgo CENEPRED del",
+    "  distrito se cruza luego con esa plata.",
+]
+r = 4
+for line in intro:
+    c = ws.cell(row=r, column=1, value=line)
+    c.font = F_H2 if line.endswith(":") else F_BODY
+    c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
+    r += 1
+
+ws.column_dimensions["A"].width = 120
+
+r += 1
+ws.cell(row=r, column=1, value="Estado de la corrida:").font = F_H2
+r += 1
+estado = ("OK (main() ejecutado y capturado)"         if RUN_PIPELINE and not REC["errores"]
+          else "CON AVISOS / ERRORES (ver hoja 'Errores')" if REC["errores"]
+          else "PIPELINE NO EJECUTADO")
+c = ws.cell(row=r, column=1, value="  " + estado)
+c.font = F_BOLD
+c.fill = OK_FILL if "OK" in estado else (BAD_FILL if "ERROR" in estado else WARN_FILL)
+
+print("Portada ✓")
+
+# %% ── HOJA 1: FUENTES DE DATOS ───────────────────────────────────────────────
+
+try:
+    ws = hoja("1. Fuentes de datos")
+    ws["A1"] = "1. Fuentes de datos y trazabilidad de orígenes"
+    ws["A1"].font = F_H2
+    ws["A2"] = "Archivos efectivamente resueltos por find_file() en esta corrida."
+    ws["A2"].font = F_SUB
+
+    headers(ws, 4, ["Descripción (find_file)", "Ruta resuelta", "Última modif."], [40, 90, 20])
+    rr = 5
+    vistos = set()
+    for desc, path in REC["files"]:
+        if (desc, path) in vistos:
+            continue
+        vistos.add((desc, path))
+        mt = ""
+        try:
+            if path and os.path.exists(path):
+                mt = _dt.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+        fila(ws, rr, [desc, path, mt], aligns=[AL, AL, AC])
+        rr += 1
+
+    rr += 1
+    ws.cell(row=rr, column=1, value="Hojas y columnas clave:").font = F_H2
+    rr += 1
+    headers(ws, rr, ["Pieza", "Archivo / Hoja", "Columnas usadas", "Qué aporta"],
+            [26, 34, 34, 50])
+    rr += 1
+    lineage = [
+        ("AUM por emisor",   "Riesgos Físicos / 'Valorización de Instrumentos'",
+         "H = Nombre (G&P); M = VALOR_VECTOR_LOCAL",
+         "Monto invertido por emisor; se reparte entre sus distritos."),
+        ("Clase RV/RF",      "Riesgos Físicos / 'Valorización de Instrumentos'",
+         "S = TIPO_RENTA (RV/RF)", "Permite el filtro por clase."),
+        ("Activos minería",  "Inputs / 'Producción Minera'",
+         "Empresa, Unidad minera, Mineral, Producción mensual",
+         "Activos físicos y producción TMF -> peso de reparto."),
+        ("Activos empresa",  "Riesgos Físicos / hoja por empresa (EMPRESAS_HOJA)",
+         "Activo, ubicación, % de distribución",
+         "Activos físicos y su peso propio de distribución."),
+        ("Utilities",        "BD Utilities / 'BD ptf'",
+         "Empresa, Central, Potencia efectiva mensual",
+         "Centrales y potencia -> peso de reparto."),
+        ("Construcción",     "BD Construcción / 'Despachos'",
+         "Empresa, Planta, Despachos mensuales",
+         "Plantas y despachos -> peso de reparto."),
+        ("Financiero",       "Resumen B-2358",
+         "Empresa, Departamento, Provincia, Distrito, Total_Creditos_Suma",
+         "Créditos por distrito -> peso de reparto."),
+        ("Riesgo CENEPRED",  "Riesgos Físicos / hoja CENEPRED",
+         "Ubigeo + niveles mm / inu / seq",
+         "Nivel de peligro (1-5) por distrito y peligro."),
+        ("FEN_Apoyo",        "Riesgos Físicos / 'FEN_Apoyo'",
+         "A=Departamento, B=Categoría, C=Región",
+         "Categoría y región FEN por departamento."),
+    ]
+    for piece, src, colu, what in lineage:
+        fila(ws, rr, [piece, src, colu, what])
+        rr += 1
+
+    print("Hoja 1 ✓")
+except Exception:
+    err = traceback.format_exc()
+    REC["errores"].append("Hoja Fuentes:\n" + err)
+    print("Hoja 1 ✗ →", err.splitlines()[-1])
+
+# %% ── HOJA 2: VENTANA TEMPORAL ───────────────────────────────────────────────
+
+try:
+    ws = hoja("2. Ventana temporal")
+    ws["A1"] = "2. Ventana temporal de pesos (semestre)"
+    ws["A1"].font = F_H2
+
+    meses = REC["ventana_meses"] or []
+    MESES_ES = {1:"Ene",2:"Feb",3:"Mar",4:"Abr",5:"May",6:"Jun",
+                7:"Jul",8:"Ago",9:"Sep",10:"Oct",11:"Nov",12:"Dic"}
+    etiqueta = (", ".join(f"{MESES_ES.get(m, m)}-{y}" for (y, m) in meses)
+                if meses else "(no capturada)")
+
+    texto = [
+        "",
+        "Regla (_meses_semestre_anterior):",
+        "  Ventana de 6 meses usada por todos los loaders. SEMESTRE_REF permite fijar una",
+        "  fecha de referencia distinta a 'hoy'.",
+        "",
+        f"  Ventana efectiva en esta corrida:  {etiqueta}   (n = {len(meses)} meses)",
+        "",
+        "Selección de columnas (_cols_en_ventana):",
+        "  Se eligen columnas cuyas fechas caen en la ventana. Si ninguna calza, hace",
+        "  fallback a los 6 meses más recientes disponibles y se avisa.",
+        "",
+        "Alcance: aplica a Minería, Utilities y Construcción. El sector financiero usa un",
+        "resumen ya agregado (hoja 5); las empresas con hoja propia usan % de distribución.",
+    ]
+    r = 3
+    for line in texto:
+        c = ws.cell(row=r, column=1, value=line)
+        c.font = (F_H2   if line.endswith(":") else
+                  F_BOLD if "Ventana efectiva" in line else F_BODY)
+        r += 1
+    ws.column_dimensions["A"].width = 110
+
+    r += 1
+    if REC["ventana_cols"]:
+        headers(ws, r, ["Archivo", "Cols en ventana", "Meses faltantes", "¿Fallback?"],
+                [40, 16, 40, 14])
+        r += 1
+        for etq, ncols, faltan, fb in REC["ventana_cols"]:
+            fila(ws, r,
+                 [etq, ncols, ", ".join(str(x) for x in faltan) or "—", "SÍ" if fb else "No"],
+                 aligns=[AL, AC, AL, AC],
+                 fills=[None, None, None, WARN_FILL if fb else None])
+            r += 1
+
+    print("Hoja 2 ✓")
+except Exception:
+    err = traceback.format_exc()
+    REC["errores"].append("Hoja Ventana:\n" + err)
+    print("Hoja 2 ✗ →", err.splitlines()[-1])
+
+# %% ── HOJA 3: CANTIDADES POR ACTIVO ─────────────────────────────────────────
+
+try:
+    ws = hoja("3. Cantidades por activo")
+    ws["A1"] = "3. Cantidades producidas por activo físico y reparto del AUM"
+    ws["A1"].font = F_H2
+    ws["A2"] = "AUM_distrito = AUM_empresa × (Producción_distrito / Producción_total_empresa)"
+    ws["A2"].font = F_SUB
+
+    cols = ["Sector", "Empresa", "Ubigeo", "Departamento", "Provincia", "Distrito",
+            "Activos físicos", "Detalle producción", "Producción distrito",
+            "Peso %", "AUM empresa (S/)", "AUM asignado distrito (S/)"]
+    headers(ws, 4, cols, [16, 24, 10, 16, 16, 16, 28, 34, 16, 12, 16, 20])
+    rr = 5
+
+    for bm in REC["build_model"]:
+        sector = bm["sector"]
+        exp    = bm["exp"]
+        um     = bm["um"]
+        det    = bm["detalle"]
+        dfa    = bm["df_assign"]
+        if dfa is None:
+            continue
+        tot_emp = {}
+        for _, row in dfa.iterrows():
+            tot_emp[row["empresa"]] = tot_emp.get(row["empresa"], 0.0) + float(row.get("tmf", 0) or 0)
+        registros = sorted(
+            (dict(row) for _, row in dfa.iterrows()),
+            key=lambda r: (str(r.get("empresa")), -float(r.get("exposicion", 0) or 0)))
+        for row in registros:
+            emp      = row.get("empresa")
+            u        = row.get("ubigeo")
+            tmf      = float(row.get("tmf", 0) or 0)
+            aum_dist = float(row.get("exposicion", 0) or 0)
+            dep, prov, dist = u2name.get(u, ("", "", ""))
+            activos   = um.get((emp, u), []) or []
+            det_items = det.get((emp, u), []) or []
+            det_txt   = ("; ".join(
+                f"{it.get('mineral')}: {it.get('cantidad_original')} {it.get('unidad')}"
+                for it in det_items) if det_items else "—")
+            peso    = (tmf / tot_emp[emp]) if tot_emp.get(emp) else 0.0
+            aum_emp = float(exp.get(emp, 0) or 0)
+            fila(ws, rr,
+                 [sector, emp, u, dep, prov, dist,
+                  ", ".join(map(str, activos)) if activos else "—",
+                  det_txt, round(tmf, 4), peso, round(aum_emp, 2), round(aum_dist, 2)],
+                 fmts=[None, None, None, None, None, None, None, None,
+                       FMT_2, FMT_P, FMT_S, FMT_S],
+                 aligns=[AL, AL, AC, AL, AL, AL, AL, AL, AR, AR, AR, AR])
+            rr += 1
+
+    if rr == 5:
+        ws.cell(row=5, column=1,
+                value="(Sin registros de build_model; ¿se corrió main()?)").font = F_SUB
+
+    print("Hoja 3 ✓")
+except Exception:
+    err = traceback.format_exc()
+    REC["errores"].append("Hoja Cantidades:\n" + err)
+    print("Hoja 3 ✗ →", err.splitlines()[-1])
+
+# %% ── HOJA 4: REGLAS Y CONDICIONALES ────────────────────────────────────────
+
+try:
+    ws = hoja("4. Reglas y condicionales")
+    ws["A1"] = "4. Reglas, condicionales y el porqué"
+    ws["A1"].font = F_H2
+
+    headers(ws, 4, ["Regla / Condicional", "Cómo opera", "Por qué"], [30, 60, 50])
+
+    def cfg(nombre, default="(no definido)"):
+        return getattr(mod, nombre, default)
+
+    reglas = [
+        ("Reparto del AUM (METODO_ASIGNACION)",
+         f"Valor vigente: '{cfg('METODO_ASIGNACION')}'. tmf_share = proporcional a producción; "
+         "units_share = proporcional al nº de unidades; equal = partes iguales. Fallback a "
+         "'equal' si la producción del periodo es 0.",
+         "Asignar la plata donde efectivamente hay actividad física."),
+        ("Geocodificación de activos",
+         "Cada activo se ubica a un ubigeo. Filas en el EXTRANJERO se excluyen del riesgo "
+         "físico Perú. Las no geocodificadas se reportan por motivo en el log.",
+         "El riesgo CENEPRED es por distrito peruano; sin ubigeo no hay riesgo asignable."),
+        ("Nivel CENEPRED (NIVEL_CENEPRED_MODO)",
+         f"Valor vigente: '{cfg('NIVEL_CENEPRED_MODO')}'. 'max' = peor de mm/inu/seq; "
+         "'promedio' = redondeo del promedio disponible.",
+         "Definir un único nivel 1-5 por distrito para la vista FEN y los cortes."),
+        ("Activos sin score (N/D)",
+         "Un activo cuyo distrito no tiene score válido NO entra en los denominadores de "
+         "porcentajes. Se reporta aparte en el Excel de activos.",
+         "No diluir los porcentajes con plata cuyo riesgo no conocemos."),
+        ("Ventana de pesos (semestre)",
+         f"6 meses (hoja 2); fallback a los 6 más recientes si la fecha no calza. "
+         f"SEMESTRE_REF vigente: {cfg('SEMESTRE_REF')}.",
+         "Capturar el nivel de actividad reciente de forma natural."),
+        ("Mapeo de nombres a canónico",
+         "Nombres de empresa de cada archivo se homologan con EQUIV_*. Lo no mapeado se "
+         "avisa en el log y se omite (no se asume).",
+         "Evitar duplicar o perder empresas por diferencias de tildes/razón social."),
+    ]
+    rr = 5
+    for a, b, c_ in reglas:
+        fila(ws, rr, [a, b, c_])
+        ws.row_dimensions[rr].height = 46
+        rr += 1
+
+    print("Hoja 4 ✓")
+except Exception:
+    err = traceback.format_exc()
+    REC["errores"].append("Hoja Reglas:\n" + err)
+    print("Hoja 4 ✗ →", err.splitlines()[-1])
+
+# %% ── HOJA 5: SECTOR FINANCIERO ──────────────────────────────────────────────
+
+try:
+    ws = hoja("5. Sector financiero")
+    ws["A1"] = "5. Sector financiero — proceso de inicio a fin"
+    ws["A1"].font = F_H2
+
+    texto = [
+        "",
+        "Origen del dato geográfico:",
+        "  Archivo 'B-2358-resumen-*.xlsx' YA PRE-PROCESADO: columnas Empresa, Departamento,",
+        "  Provincia, Distrito y Total_Creditos_Suma. El crédito por distrito juega el mismo",
+        "  rol que la producción (TMF) en minería: es el peso de reparto.",
+        "",
+        "Naturaleza semestral:",
+        "  El reporte B-2358 de la SBS es semestral. Este sector NO pasa por la ventana",
+        "  _meses_semestre_anterior (esa es para series mensuales). La semestralidad viene",
+        "  en el propio resumen; no se promedia ni anualiza.",
+        "",
+        "Pasos:",
+        "  1. AUM del banco: de 'Valorización de Instrumentos', homologando razón social.",
+        "  2. Geografía: del resumen B-2358 se obtiene crédito por (banco, distrito).",
+        "  3. Reparto: AUM_banco se reparte por distrito en proporción al crédito.",
+        "  4. Cruce de riesgo: se aplica nivel CENEPRED igual que a los demás sectores.",
+        "",
+        "Notas de honestidad:",
+        "  · Bancos no mapeados al canónico se OMITEN y listan en el log.",
+        "  · El 'activo físico' bancario no es una unidad nombrada: se representa por la",
+        "    presencia de crédito en el distrito.",
+    ]
+    r = 3
+    for line in texto:
+        c = ws.cell(row=r, column=1, value=line)
+        c.font = F_H2 if line.endswith(":") else F_BODY
+        r += 1
+    ws.column_dimensions["A"].width = 112
+
+    df = REC.get("financiero_df")
+    if df is not None and len(df):
+        r += 1
+        ws.cell(row=r, column=1,
+                value="Crédito por banco y distrito (peso de reparto):").font = F_H2
+        r += 1
+        headers(ws, r, ["Banco (canónico)", "Titular en archivo", "Departamento",
+                        "Provincia", "Distrito", "Crédito (Miles S/)"],
+                [22, 28, 16, 16, 16, 16])
+        r += 1
+        sub = df.copy()
+        try:
+            sub = sub.sort_values(["empresa", "acum"], ascending=[True, False])
+        except Exception:
+            pass
+        for _, row in sub.head(400).iterrows():
+            fila(ws, r,
+                 [row.get("empresa"), row.get("titular"), row.get("depto"),
+                  row.get("prov"), row.get("dist"),
+                  round(float(row.get("acum", 0) or 0), 2)],
+                 fmts=[None, None, None, None, None, FMT_S],
+                 aligns=[AL, AL, AL, AL, AL, AR])
+            r += 1
+
+    print("Hoja 5 ✓")
+except Exception:
+    err = traceback.format_exc()
+    REC["errores"].append("Hoja Financiero:\n" + err)
+    print("Hoja 5 ✗ →", err.splitlines()[-1])
+
+# %% ── HOJA 6: VERIFICACIÓN FEN ───────────────────────────────────────────────
+
+try:
+    ws = hoja("6. Verificación FEN")
+    ws["A1"] = "6. Verificación del dashboard FEN (reconciliación independiente)"
+    ws["A1"].font = F_H2
+    ws["A2"] = ("Recalculamos la sección de Regiones a partir de los districts reales y de "
+                "FEN_Apoyo. Debe cuadrar con lo que se ve en el dashboard.")
+    ws["A2"].font = F_SUB
+
+    fa = REC.get("fen_apoyo")
+    fen_dep, cats, region_dep = (fa if fa and len(fa) == 3 else ({}, [], {}))
+    grupos = recompute_region(districts, fen_dep, region_dep)
+    total  = sum(g["aum"] for g in grupos.values()) or 1.0
+
+    headers(ws, 4,
+            ["Región - Categoría", "AUM Región (S/)", "AUM Total (S/)",
+             "Peso %", "# Empresas", "# Activos"],
+            [34, 18, 18, 10, 12, 10])
+    rr = 5
+    suma_peso = 0.0
+    for label in sorted(grupos):
+        g    = grupos[label]
+        peso = g["aum"] / total
+        suma_peso += peso
+        nact = sum(e["n"] for e in g["emp"].values())
+        fila(ws, rr,
+             [label, round(g["aum"], 2), round(total, 2), peso, len(g["emp"]), nact],
+             fmts=[None, FMT_S, FMT_S, FMT_P, None, None],
+             aligns=[AL, AR, AR, AR, AC, AC])
+        rr += 1
+    fila(ws, rr,
+         ["TOTAL", round(total, 2), round(total, 2), suma_peso, "", ""],
+         fmts=[None, FMT_S, FMT_S, FMT_P, None, None],
+         aligns=[AL, AR, AR, AR, AC, AC],
+         fills=[FILL_SUB] * 6)
+
+    print("Hoja 6 ✓")
+except Exception:
+    err = traceback.format_exc()
+    REC["errores"].append("Hoja Verif FEN:\n" + err)
+    print("Hoja 6 ✗ →", err.splitlines()[-1])
+
+# %% ── HOJA 7: VERIFICACIÓN ACTIVOS ──────────────────────────────────────────
+
+try:
+    ws = hoja("7. Verificación Activos")
+    ws["A1"] = "7. Verificación del dashboard de activos (scores)"
+    ws["A1"].font = F_H2
+    ws["A2"] = ("Recalculamos el Score CENEPRED por empresa ponderado por plata distrital. "
+                "Contrastar contra el Excel 'Riesgos Climáticos' (hoja 'Score por Empresa').")
+    ws["A2"].font = F_SUB
+
+    scores = recompute_scores(districts, exp_clase)
+    headers(ws, 4,
+            ["Empresa", "Sector", "Score MM", "Score Inund.", "Score Sequía", "Score Global"],
+            [26, 18, 12, 12, 12, 12])
+    rr = 5
+    for e in sorted(scores, key=lambda z: -scores[z]["global"]):
+        s = scores[e]
+        fila(ws, rr,
+             [e, emp_sector.get(e, ""), s["mm"], s["inu"], s["seq"], s["global"]],
+             fmts=[None, None, FMT_2, FMT_2, FMT_2, FMT_2],
+             aligns=[AL, AL, AC, AC, AC, AC])
+        rr += 1
+
+    print("Hoja 7 ✓")
+except Exception:
+    err = traceback.format_exc()
+    REC["errores"].append("Hoja Verif Activos:\n" + err)
+    print("Hoja 7 ✗ →", err.splitlines()[-1])
+
+# %% ── HOJA 8: CHECKS AUTOMÁTICOS ────────────────────────────────────────────
+
+try:
+    ws = hoja("8. Checks automáticos")
+    ws["A1"] = "8. Checks automáticos (semáforo)"
+    ws["A1"].font = F_H2
+    headers(ws, 3, ["Check", "Resultado", "Detalle"], [50, 14, 70])
+    rr = 4
+
+    def check(nombre, ok, detalle):
+        global rr
+        fila(ws, rr, [nombre, "PASA" if ok else "REVISAR", detalle],
+             aligns=[AL, AC, AL],
+             fills=[None, OK_FILL if ok else BAD_FILL, None])
+        rr += 1
+
+    # 1) AUM repartido == AUM total empresa
+    peor = 0.0; worst_emp = ""
+    for bm in REC["build_model"]:
+        dfa = bm["df_assign"]; exp = bm["exp"]
+        if dfa is None:
+            continue
+        asign = {}
+        for _, row in dfa.iterrows():
+            asign[row["empresa"]] = asign.get(row["empresa"], 0.0) + float(row.get("exposicion", 0) or 0)
+        for e, total_emp in exp.items():
+            diff = abs(asign.get(e, 0.0) - float(total_emp or 0))
+            if diff > peor:
+                peor, worst_emp = diff, e
+    check("Suma del AUM repartido = AUM total de la empresa", peor <= TOL_ABS,
+          f"Máxima diferencia S/ {peor:,.2f} (empresa: {worst_emp}). Tolerancia S/ {TOL_ABS:,.0f}.")
+
+    # 2) build_model capturado
+    check("Pipeline capturado (build_model registrado)", len(REC["build_model"]) > 0,
+          f"{len(REC['build_model'])} sector(es) capturado(s).")
+
+    # 3) districts capturados
+    check("Districts finales capturados", len(districts) > 0,
+          f"{len(districts)} distritos.")
+
+    # 4) Pesos de regiones suman 100%
+    fa = REC.get("fen_apoyo")
+    fen_dep, _, region_dep = (fa if fa and len(fa) == 3 else ({}, [], {}))
+    grupos = recompute_region(districts, fen_dep, region_dep)
+    total  = sum(g["aum"] for g in grupos.values())
+    suma   = sum((g["aum"] / total) for g in grupos.values()) if total else 0
+    check("Sección Regiones: pesos suman 100%",
+          abs(suma - 1.0) * 100 <= TOL_PCT if total else False,
+          f"Suma de pesos = {suma * 100:.2f}% (tolerancia {TOL_PCT}pp).")
+
+    # 5) Reconciliación con Excel de activos
+    try:
+        import glob
+        import openpyxl
+        out_dir = getattr(mod, "OUT_DIR", None)
+        xls = []
+        if out_dir and os.path.isdir(out_dir):
+            xls = glob.glob(os.path.join(out_dir, "Riesgos Clim*.xlsx"))
+        if xls:
+            xls.sort(key=os.path.getmtime)
+            wbx = openpyxl.load_workbook(xls[-1], read_only=True, data_only=True)
+            if "Score por Empresa" in wbx.sheetnames:
+                wsx = wbx["Score por Empresa"]
+                excel_scores = {}
+                for row in wsx.iter_rows(min_row=5, values_only=True):
+                    if row and row[0]:
+                        excel_scores[str(row[0])] = row
+                scores = recompute_scores(districts, exp_clase)
+                peor = 0.0; worst = ""
+                for e, s in scores.items():
+                    rowx = excel_scores.get(e)
+                    if rowx and len(rowx) >= 7 and isinstance(rowx[6], (int, float)):
+                        diff = abs(float(rowx[6]) - s["global"])
+                        if diff > peor:
+                            peor, worst = diff, e
+                check("Score por Empresa (auditoría) = Excel 'Riesgos Climáticos'",
+                      peor <= 0.01,
+                      f"Máxima diferencia {peor:.3f} (empresa: {worst}). "
+                      f"Archivo: {os.path.basename(xls[-1])}.")
+            wbx.close()
+        else:
+            check("Reconciliación con Excel de activos", True,
+                  "No se encontró el Excel 'Riesgos Climáticos'; se omite.")
+    except Exception as e_rec:
+        check("Reconciliación con Excel de activos", False, f"No evaluable: {e_rec}")
+
+    print("Hoja 8 ✓")
+except Exception:
+    err = traceback.format_exc()
+    REC["errores"].append("Hoja Checks:\n" + err)
+    print("Hoja 8 ✗ →", err.splitlines()[-1])
+
+# %% ── GUARDAR EXCEL ──────────────────────────────────────────────────────────
+
+if REC["errores"]:
+    ws = hoja("Errores")
+    ws["A1"] = "Avisos y errores durante la auditoría"
+    ws["A1"].font = F_H2
+    ws.column_dimensions["A"].width = 140
+    r = 3
+    for e in REC["errores"]:
+        for line in str(e).splitlines():
+            ws.cell(row=r, column=1, value=line).font = F_BODY
+            r += 1
+        r += 1
+
+os.makedirs(os.path.dirname(AUDIT_OUT) or ".", exist_ok=True)
+wb.save(AUDIT_OUT)
+print(f"\n✅ Excel guardado en:\n   {AUDIT_OUT}")
+if REC["errores"]:
+    print(f"⚠️  {len(REC['errores'])} aviso(s)/error(es) — ver hoja 'Errores' en el Excel.")
