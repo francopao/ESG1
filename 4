@@ -1,0 +1,71 @@
+# ---------- SECTOR FINANCIERO (declarativo: hoja 'Holdings') ----------
+    # Cada emisor toma SU PROPIO AUM y clase (Valorización) y se reparte sobre una o más
+    # geografías: agencias de un banco del B-2358 (Fuente=Banca) y/o una hoja de activos
+    # (Fuente=Hoja). 'AUM_Factor' parte el AUM entre geografías (deben sumar 1 por emisor;
+    # si no, se avisa y se mapea esa fracción).
+    if INCLUIR_FINANCIERO:
+        try:
+            holdings = load_holdings(risk_path)
+            if not holdings:
+                log("No se encontró la hoja 'Holdings' (o está vacía); el sector "
+                    "financiero quedará vacío. Revísala en el Excel.", "WARN")
+            else:
+                emis_fin = sorted({h["emisor"] for h in holdings})
+                exp_fin = load_exposicion_sector(
+                    risk_path, sheet_val, {e: e for e in emis_fin}, emis_fin,
+                    "financiera", PISTAS_BANCO)
+
+                geo_bancos = None
+                if any(h["fuente"] == "Banca" for h in holdings):
+                    fin_path = find_file(FIN_DIR, FIN_PATTERNS, "RESUMEN DE BANCOS (créditos)")
+                    log(f"Financiero : {fin_path}")
+                    geo_bancos = load_geografia_bancos(fin_path)
+
+                # Validación Σ factores por emisor (avisa, no bloquea)
+                _suma_fac = {}
+                for h in holdings:
+                    _suma_fac[h["emisor"]] = _suma_fac.get(h["emisor"], 0.0) + h["factor"]
+                for e, s in _suma_fac.items():
+                    if abs(s - 1.0) > 1e-6:
+                        log(f"Holdings: '{e}' tiene AUM_Factor que suma {s:.2f} (≠ 1.00); "
+                            f"se mapea esa fracción de su AUM.", "WARN")
+
+                for h in holdings:
+                    emisor = h["emisor"]
+                    aum = exp_fin.get(emisor, 0.0) * h["factor"]
+                    if aum <= 0:
+                        log(f"Holdings: '{emisor}' sin AUM en Valorización (o factor 0); "
+                            f"se omite ese renglón.", "WARN")
+                        continue
+                    if h["fuente"] == "Banca":
+                        if geo_bancos is None or geo_bancos.empty:
+                            continue
+                        claves = {norm(b) for b in h["bancos"]}
+                        df_geo = geo_bancos[geo_bancos["banco_n"].isin(claves)].copy()
+                        if df_geo.empty:
+                            log(f"Holdings: '{emisor}' sin geografía para banco(s) "
+                                f"{h['bancos']}; se omite ese renglón.", "WARN")
+                            continue
+                        df_geo["empresa"] = emisor
+                    elif h["fuente"] == "Hoja":
+                        df_geo = load_holding_activos(risk_path, h["hojas"])
+                        if df_geo.empty:
+                            log(f"Holdings: '{emisor}' sin activos en {h['hojas']}; "
+                                f"se omite ese renglón.", "WARN")
+                            continue
+                        df_geo["empresa"] = emisor
+                    else:
+                        continue
+                    _add_sector(df_geo, {emisor: aum}, [emisor], h["sector"])
+
+                # AUM reportado por emisor = su AUM propio total (no la última fracción)
+                for e in emis_fin:
+                    if e in exp_comb:
+                        exp_comb[e] = exp_fin.get(e, 0.0)
+        except SystemExit:
+            raise
+        except Exception as e:
+            import traceback
+            log(f"No se pudo procesar el sector financiero: {e}\n{traceback.format_exc()}\n"
+                f"      -> Se continúa sin él. Revisa la hoja 'Holdings' / FIN_DIR / "
+                f"FIN_PATTERNS / nombres en Valorización.", "WARN")
