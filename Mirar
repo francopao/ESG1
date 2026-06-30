@@ -1,0 +1,17 @@
+    # Excel histórico de Riesgos Climáticos (no afecta al HTML si falla)
+    try:
+        periodo = _periodo_actual(mitigantes_path)
+        generar_excel_riesgos(out_dir, districts, exp_clase, emp_sector,
+                              mitigantes, periodo, fx, stamp, logfn=logfn)
+    except Exception as e:
+        logfn(f"[Activos] No se pudo generar el Excel de riesgos: {e}")
+
+    # Excel resumen: exposición por empresa x nivel CENEPRED + scores + mitigante
+    try:
+        periodo = _periodo_actual(mitigantes_path)
+        generar_excel_tabla_resumen(out_dir, districts, exp_clase, emp_sector,
+                                    mitigantes, periodo, stamp, logfn=logfn)
+    except Exception as e:
+        logfn(f"[Activos] No se pudo generar el Excel resumen: {e}")
+
+    return out_path
