@@ -1,0 +1,182 @@
+Perfecto, alineados. Te doy los tres cambios: (1) armar `holding_info` en `main()`, (2) propagarlo por las dos firmas, (3) las columnas nuevas + ocultado en el Excel.
+
+## Cambio 1 — armar `holding_info` en `main()`
+
+Dentro del bloque `if INCLUIR_FINANCIERO:`, justo **después** de obtener `exp_fin` y **antes** del `for h in holdings:`, agrega el armado del diccionario. Localiza esto:
+
+```python
+                emis_fin = sorted({h["emisor"] for h in holdings})
+                exp_fin = load_exposicion_sector(
+                    risk_path, sheet_val, {e: e for e in emis_fin}, emis_fin,
+                    "financiera", PISTAS_BANCO)
+```
+
+Y agrega justo debajo:
+
+```python
+                # NUEVO: info por emisor holding para el Excel (AUM original, % Perú, países)
+                holding_info = {}
+                for h in holdings:
+                    e = h["emisor"]
+                    hi = holding_info.setdefault(
+                        e, {"aum_original": exp_fin.get(e, 0.0),
+                            "pct_peru": 0.0, "paises": []})
+                    hi["paises"].append((h.get("pais", "Perú"), h["factor"]))
+                    if h.get("es_peru", True):
+                        hi["pct_peru"] += h["factor"]
+```
+
+`aum_original` es el AUM del emisor en Valorización **antes** de aplicar factores (eso es justo lo que devuelve `exp_fin`). `pct_peru` suma solo los factores peruanos. `paises` guarda todas las filas (Perú + extranjero).
+
+Ahora baja al final del bloque financiero. Ya tienes `holding_info` pero hay que llevarlo a la extensión de activos. La llamada a `generar_dashboard_activos` está más abajo en `main()`. Modifícala para pasarle el dict (si el bloque financiero no corrió, pásale `{}`):
+
+```python
+        generar_dashboard_activos(
+            out_dir=OUT_DIR,
+            districts=districts,
+            exp_clase=exp_clase,
+            aum_cartera=aum_cartera,
+            emp_sector=emp_sector,
+            risk_path=risk_path,
+            geojson=geojson,
+            enfen=enfen,
+            stamp=stamp,
+            mitigantes_path=r"...\Mitigantes.xlsx",
+            clima_itcp=fen_chart.get("clima", {}).get("ITCP", []),
+            holding_info=locals().get("holding_info", {}),   # NUEVO
+            logfn=lambda m: log(m))
+```
+
+Uso `locals().get("holding_info", {})` para que no falle si `INCLUIR_FINANCIERO` está en False (la variable no existiría).
+
+## Cambio 2 — propagar por las dos firmas
+
+**`generar_dashboard_activos`:** añade el parámetro y pásalo a la generación del Excel resumen. En la firma:
+
+```python
+def generar_dashboard_activos(out_dir, districts, exp_clase, aum_cartera,
+                              emp_sector, risk_path, geojson,
+                              enfen=None, mitigantes_path=None,
+                              clima_itcp=None,
+                              holding_info=None,                 # NUEVO
+                              stamp=None, logfn=print):
+```
+
+Y en la llamada interna a `generar_excel_tabla_resumen` (la que añadiste antes):
+
+```python
+    try:
+        periodo = _periodo_actual(mitigantes_path)
+        sheet_val = pick_sheet(risk_path, SHEET_VALORIZ_HINTS, "Valorización de Instrumentos")
+        generar_excel_tabla_resumen(out_dir, districts, exp_clase, emp_sector,
+                                    mitigantes, periodo, risk_path, sheet_val,
+                                    _equiv_exposicion_all(),
+                                    holding_info=holding_info,    # NUEVO
+                                    stamp=stamp, logfn=logfn)
+    except Exception as e:
+        logfn(f"[Activos] No se pudo generar el Excel resumen: {e}")
+```
+
+## Cambio 3 — columnas nuevas + ocultado en `generar_excel_tabla_resumen`
+
+Añade `holding_info=None` a la firma:
+
+```python
+def generar_excel_tabla_resumen(out_dir, districts, exp_clase, emp_sector,
+                                mitigantes, periodo, risk_path, sheet_val,
+                                equiv_canonico, holding_info=None,   # NUEVO
+                                stamp=None, logfn=print):
+```
+
+Justo después de `niveles = [1, 2, 3, 4, 5]` agrega:
+
+```python
+    holding_info = holding_info or {}                                 # NUEVO
+```
+
+Ahora la fila de encabezados. Localiza el bloque que arma `cols` y reemplázalo para insertar las dos columnas de AUM/% justo tras "AUM Total (S/)", y la de países al lado:
+
+```python
+        cols = ["Empresa", "Sector", "AUM Total (S/)",
+                "AUM sin ponderar (S/)", "% ponderación", "Países"]   # NUEVO
+        for L in niveles:
+            cols += [f"% Nivel {L}", f"Monto Nivel {L} (S/)"]
+        cols += ["Score MM", "Score Inund.", "Score Sequía", "Score Global",
+                 f"Mitigante ({periodo})", "Clasificación ERR"]
+```
+
+En el armado de cada fila (`fila = [...]`), inserta los tres valores nuevos tras `tot`:
+
+```python
+            hi = holding_info.get(e)                                  # NUEVO
+            if hi:                                                    # NUEVO
+                aum_orig = hi["aum_original"]
+                pct_pond = hi["pct_peru"]
+                paises = "; ".join(f"{p}: {f*100:.0f}%" for p, f in hi["paises"])
+            else:                                                     # no-holding
+                aum_orig = tot          # sin ponderación: igual al AUM Total
+                pct_pond = 1.0
+                paises = ""             # vacío, como pediste
+            fila = [e, emp_sector.get(e, ""), tot,
+                    aum_orig, pct_pond, paises]                       # NUEVO
+            for L in niveles:
+                m = aum_emp_niv.get(e, {}).get(L, 0)
+                fila += [(m / tot if tot else 0), m]
+            fila += [sc["mm"], sc["inu"], sc["seq"], sc["global"], mit, err]
+```
+
+El formateo por celda usaba índices fijos de columna (`j == 3`, `4 <= j <= 13`, etc.). Como insertamos 3 columnas, **todos esos índices se corren +3**. Reemplaza el `for j, v in enumerate(fila ...)` por esta versión recalculada:
+
+```python
+            for j, v in enumerate(fila, start=1):
+                c = ws.cell(row=r, column=j, value=v); c.font = F_BODY; c.border = BORDER
+                if j == 22:                                  # Clasificación ERR (última)
+                    c.alignment = A_LW
+                elif j == 6:                                 # Países
+                    c.alignment = A_L
+                else:
+                    c.alignment = A_L if j in (1, 2) else (A_R if j in (3, 4) else A_C)
+                if j == 3:                                   # AUM Total
+                    c.number_format = FMT_S
+                elif j == 4:                                 # AUM sin ponderar
+                    c.number_format = FMT_S
+                elif j == 5:                                 # % ponderación
+                    c.number_format = FMT_P
+                elif 7 <= j <= 16:                           # bloques % / monto por nivel
+                    c.number_format = FMT_P if (j % 2 == 1) else FMT_S
+                elif 17 <= j <= 20:                          # scores
+                    c.number_format = FMT_SC; c.fill = fill_score(v)
+                elif j == 21 and fill_mit(v):                # mitigante
+                    c.fill = fill_mit(v)
+```
+
+Nota el cambio de paridad en los bloques de nivel: antes el `%` caía en columnas pares; ahora con el corrimiento cae en **impares** (`j % 2 == 1`). Por eso lo invertí.
+
+Anchos de columna (reemplaza el `widths`):
+
+```python
+        widths = [26, 16, 18, 18, 13, 26] + [11, 16] * 5 + [10, 11, 11, 12, 16, 30]
+```
+
+Y el `freeze_panes` muévelo para que congele hasta Países (ahora la primera columna de datos variables es la G):
+
+```python
+        ws.freeze_panes = "G5"
+```
+
+Finalmente, **ocultar las columnas de Monto por nivel y de Score**. Justo antes de `ws.freeze_panes`, agrega:
+
+```python
+        # NUEVO: ocultar Monto Nivel 1-5 (columnas pares 8,10,12,14,16) y Scores (17-20)
+        for j in (8, 10, 12, 14, 16, 17, 18, 19, 20):
+            ws.column_dimensions[get_column_letter(j)].hidden = True
+```
+
+Eso deja ocultas las 5 columnas de monto por nivel y las 4 de score; el usuario las desoculta seleccionando las columnas vecinas y "Mostrar". Las columnas de **%** por nivel quedan visibles.
+
+Dos verificaciones tras correr:
+
+- La fila de Nexa (si la pusiste como holding 0.75/0.25) debe mostrar AUM sin ponderar = valor completo, % ponderación = 75%, Países = "Perú: 75%; Brasil: 25%", y AUM Total = 75% del original.
+- Una minera normal debe mostrar AUM sin ponderar = AUM Total, % ponderación = 100%, Países vacío.
+
+Si al abrir el Excel ves que algún formato cayó en la columna equivocada, casi seguro es un índice de los recalculados: dime cuál columna se ve mal y lo ajusto, porque el corrimiento +3 es el único punto frágil de este cambio.
