@@ -1,0 +1,20 @@
+        for e in emisores:
+            tot = aum_emp_tot.get(e, 0) or 0
+            sc = scores.get(e, {"mm": 0, "inu": 0, "seq": 0, "global": 0})
+            mit = _mit_lookup(e, mitigantes)
+            err = "; ".join(err_map.get(e, [])) or "—"
+            hi = holding_info.get(e)                                  # NUEVO
+            if hi:                                                    # NUEVO
+                aum_orig = hi["aum_original"]
+                pct_pond = hi["pct_peru"]
+                paises = "; ".join(f"{p}: {f*100:.0f}%" for p, f in hi["paises"])
+            else:                                                     # no-holding
+                aum_orig = tot          # sin ponderación: igual al AUM Total
+                pct_pond = 1.0
+                paises = ""             # vacío, como pediste
+            fila = [e, emp_sector.get(e, ""), tot,
+                    aum_orig, pct_pond, paises]                       # NUEVO
+            for L in niveles:
+                m = aum_emp_niv.get(e, {}).get(L, 0)
+                fila += [(m / tot if tot else 0), m]
+            fila += [sc["mm"], sc["inu"], sc["seq"], sc["global"], mit, err]
