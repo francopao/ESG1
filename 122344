@@ -1,0 +1,128 @@
+Perfecto, vamos. Te doy primero cómo llenar la hoja, luego los dos cambios de código.
+
+## Cómo llenar la hoja `Holdings`
+
+Columnas (el orden no importa, el script las busca por nombre; tolera mayúsculas/acentos):
+
+`Emisor | Fuente | Banco | Hoja_Activos | AUM_Factor | Sector | País`
+
+Reglas:
+
+- **Una fila por business line.** Varias filas pueden compartir `Emisor`.
+- **Σ de `AUM_Factor` de un mismo emisor = 1.00** contando Perú + extranjero. Si no suma 1, el script solo avisa (no rompe).
+- **Filas Perú:** llenan `Fuente` (`Hoja` o `Banca`), su `Hoja_Activos` (o `Banco` si es Banca), `Sector` y `País = Perú`.
+- **Filas extranjeras:** `País` distinto de Perú (ej. `Chile`, `Colombia`). `Fuente`, `Banco`, `Hoja_Activos` y `Sector` pueden ir **vacíos**. Solo importa su `AUM_Factor`.
+
+Ejemplo (holding con 2 business lines peruanos y 1 extranjero):
+
+| Emisor | Fuente | Banco | Hoja_Activos | AUM_Factor | Sector | País |
+|---|---|---|---|---|---|---|
+| HoldingX | Hoja | | ActivosX_Cemento | 0.45 | Construcción | Perú |
+| HoldingX | Hoja | | ActivosX_Energia | 0.25 | Utilities | Perú |
+| HoldingX | | | | 0.30 | | Chile |
+
+Aquí se mapea el 70% del AUM (0.45 + 0.25) sobre los activos peruanos; el 30% chileno queda informativo y ausente del output.
+
+Las filas existentes (financieras, sin columna País) **no se tocan**: si no hay columna País o la celda está vacía, se asume Perú y el comportamiento es idéntico al actual.
+
+## Cambio 1 — `load_holdings`
+
+Necesita leer `País` y marcar la fila como extranjera. Modifica solo la parte donde se resuelven los índices y se arma cada renglón. Localiza este bloque dentro de `load_holdings`:
+
+```python
+    iE = idx("Emisor"); iF = idx("Fuente"); iB = idx("Banco", "Bancos")
+    iHA = idx("Hoja_Activos", "Hoja Activos", "Hoja")
+    iFac = idx("AUM_Factor", "AUM Factor", "Factor"); iS = idx("Sector")
+    out = []
+    for r in rows[hdr_i + 1:]:
+        def cel(i):
+            return r[i] if (i is not None and i < len(r)) else None
+        if cel(iE) is None:
+            continue
+        fuente = (str(cel(iF)).strip() if cel(iF) else "Banca")
+        bancos = [x.strip() for x in str(cel(iB)).split(";")] if cel(iB) else []
+        hojas = [x.strip() for x in str(cel(iHA)).split(";")] if cel(iHA) else []
+        fac = _peso_a_decimal(cel(iFac)) if cel(iFac) is not None else 1.0
+        out.append({"emisor": str(cel(iE)).strip(),
+                    "fuente": ("Hoja" if norm(fuente).startswith("HOJA") else "Banca"),
+                    "bancos": bancos, "hojas": hojas,
+                    "factor": (fac if fac is not None else 1.0),
+                    "sector": (str(cel(iS)).strip() if cel(iS) else SECTOR_FINANCIERO)})
+```
+
+Reemplázalo por (cambios marcados `# NUEVO`):
+
+```python
+    iE = idx("Emisor"); iF = idx("Fuente"); iB = idx("Banco", "Bancos")
+    iHA = idx("Hoja_Activos", "Hoja Activos", "Hoja")
+    iFac = idx("AUM_Factor", "AUM Factor", "Factor"); iS = idx("Sector")
+    iPais = idx("Pais", "País", "Country")                         # NUEVO
+    out = []
+    for r in rows[hdr_i + 1:]:
+        def cel(i):
+            return r[i] if (i is not None and i < len(r)) else None
+        if cel(iE) is None:
+            continue
+        # NUEVO: país de la fila (default Perú si no hay columna o celda vacía)
+        pais = (str(cel(iPais)).strip() if cel(iPais) else "Perú")
+        es_peru = norm(pais) in ("PERU", "PE", "")
+        fac = _peso_a_decimal(cel(iFac)) if cel(iFac) is not None else 1.0
+        if not es_peru:                                            # NUEVO
+            # fila extranjera: solo informativa (cuenta para Σ factores), sin geografía
+            out.append({"emisor": str(cel(iE)).strip(), "fuente": "Extranjero",
+                        "bancos": [], "hojas": [],
+                        "factor": (fac if fac is not None else 1.0),
+                        "sector": (str(cel(iS)).strip() if cel(iS) else ""),
+                        "pais": pais, "es_peru": False})
+            continue
+        fuente = (str(cel(iF)).strip() if cel(iF) else "Banca")
+        bancos = [x.strip() for x in str(cel(iB)).split(";")] if cel(iB) else []
+        hojas = [x.strip() for x in str(cel(iHA)).split(";")] if cel(iHA) else []
+        out.append({"emisor": str(cel(iE)).strip(),
+                    "fuente": ("Hoja" if norm(fuente).startswith("HOJA") else "Banca"),
+                    "bancos": bancos, "hojas": hojas,
+                    "factor": (fac if fac is not None else 1.0),
+                    "sector": (str(cel(iS)).strip() if cel(iS) else SECTOR_FINANCIERO),
+                    "pais": pais, "es_peru": True})                # NUEVO
+```
+
+## Cambio 2 — bucle de holdings en `main()`
+
+La validación Σ factores **ya cuenta todas las filas** (recorre `holdings` completo), así que las extranjeras entran solas en esa suma — bien. Solo hay que saltarse las extranjeras al mapear. Localiza el inicio del `for h in holdings:` (justo después de la validación de factores):
+
+```python
+                for h in holdings:
+                    emisor = h["emisor"]
+                    aum = exp_fin.get(emisor, 0.0) * h["factor"]
+                    if aum <= 0:
+                        log(f"Holdings: '{emisor}' sin AUM en Valorización (o factor 0); "
+                            f"se omite ese renglón.", "WARN")
+                        continue
+```
+
+Reemplázalo por (solo se añade el chequeo `es_peru`):
+
+```python
+                for h in holdings:
+                    emisor = h["emisor"]
+                    # NUEVO: fila extranjera -> informativa; ya contó en Σ factores, no se mapea
+                    if not h.get("es_peru", True):
+                        log(f"Holdings: '{emisor}' business line en "
+                            f"{h.get('pais','extranjero')} (factor {h['factor']:.2f}) "
+                            f"queda informativo; no se mapea (activos fuera de Perú).")
+                        continue
+                    aum = exp_fin.get(emisor, 0.0) * h["factor"]
+                    if aum <= 0:
+                        log(f"Holdings: '{emisor}' sin AUM en Valorización (o factor 0); "
+                            f"se omite ese renglón.", "WARN")
+                        continue
+```
+
+Eso es todo. No hace falta tocar `load_holding_activos` ni el Excel de exposición: como las filas extranjeras nunca llegan a `_add_sector`, no aparecen en `districts`, `emp_sector`, mapa ni tablas.
+
+Dos puntos de control para que verifiques tras correr:
+
+- En el log debe salir la línea "business line en Chile (factor 0.30) queda informativo" por cada fila extranjera. Si no aparece, revisa que el header de la columna se llame algo que el script reconozca (`País`, `Pais` o `Country`).
+- La validación `AUM_Factor que suma X (≠ 1.00)` que ya tienes te avisará si te olvidaste de alguna fracción. Con las filas extranjeras incluidas, debe darte 1.00 por emisor.
+
+¿Tu columna se va a llamar exactamente `País` (con tilde)? El script la reconoce con o sin tilde, pero confírmame que no usarás un nombre tipo "Jurisdicción" o "Domicilio", porque entonces habría que añadir ese alias al `idx(...)`.
