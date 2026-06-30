@@ -1,0 +1,132 @@
+Aquí tienes una función nueva y su llamada (hook) en `main()`. Es 100% aditiva: no toca nada del código existente y reutiliza `_calc_scores_py`, `_mit_lookup` y los datos que ya circulan por `main()`.
+
+**1) Agrega esta función** (por ejemplo, justo antes de `def generar_excel_riesgos(...)`):
+
+```python
+def generar_excel_tabla_resumen(out_dir, districts, exp_clase, emp_sector,
+                                mitigantes, periodo, stamp=None, logfn=print):
+    """Excel de UNA sola tabla estructurada: por empresa, % y monto del AUM en cada
+    nivel CENEPRED (1-5) — equivalente al chart tipo tabla 3 — más los scores por
+    peligro (MM/Inundación/Sequías + Global) y el mitigante (chart tipo tabla 4).
+    El % por empresa usa como denominador su AUM con score válido (suma fila=100%)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from datetime import datetime
+
+    AZUL = "1E2E6E"
+    F_TIT = Font(name="Calibri", size=14, bold=True, color=AZUL)
+    F_SUB = Font(name="Calibri", size=10, color="7E8083")
+    F_HEAD = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+    F_BODY = Font(name="Calibri", size=10, color="1F2533")
+    FILL_HEAD = PatternFill("solid", fgColor=AZUL)
+    THIN = Side(style="thin", color="DCDDDE")
+    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    A_L = Alignment(horizontal="left", vertical="center")
+    A_C = Alignment(horizontal="center", vertical="center")
+    A_R = Alignment(horizontal="right", vertical="center")
+    FMT_S = '#,##0;(#,##0);-'
+    FMT_P = '0.0%'
+    FMT_SC = '0.00'
+
+    def fill_score(v):
+        if v < 2:  return PatternFill("solid", fgColor="D4EDDA")
+        if v < 3:  return PatternFill("solid", fgColor="FFF3CD")
+        if v <= 4: return PatternFill("solid", fgColor="FFE0B2")
+        return PatternFill("solid", fgColor="F8D7DA")
+
+    def fill_mit(v):
+        return {"Bajo": PatternFill("solid", fgColor="D4EDDA"),
+                "Medio": PatternFill("solid", fgColor="FFF3CD"),
+                "Alto": PatternFill("solid", fgColor="F8D7DA")}.get(v)
+
+    niveles = [1, 2, 3, 4, 5]
+    scores = _calc_scores_py(districts)
+
+    # AUM por (emisor, nivel) considerando SOLO distritos con nivel CENEPRED válido (1-5).
+    # 'nivel' es el nivel global del distrito (max o comb, según NIVEL_CENEPRED_MODO).
+    aum_emp_niv = {}    # emisor -> {nivel: monto}
+    aum_emp_tot = {}    # emisor -> total con score válido
+    for d in districts:
+        L = d.get("nivel")
+        if L not in niveles:
+            continue
+        for a in d.get("aportes", []):
+            m = a.get("monto", 0) or 0
+            if m <= 0:
+                continue
+            e = a["emisor"]
+            aum_emp_niv.setdefault(e, {})[L] = aum_emp_niv.setdefault(e, {}).get(L, 0) + m
+            aum_emp_tot[e] = aum_emp_tot.get(e, 0) + m
+
+    emisores = sorted(aum_emp_tot.keys())
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Exposición x Riesgo"
+    ws.sheet_view.showGridLines = False
+    ws["A1"] = "Exposición de cada empresa por categoría de riesgo CENEPRED"
+    ws["A1"].font = F_TIT
+    ws["A2"] = (f"Periodo {periodo} · Generado {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
+                f"% por empresa = AUM en el nivel / AUM total de la empresa con score válido (fila=100%).")
+    ws["A2"].font = F_SUB
+
+    # Encabezados: Empresa | Sector | AUM Total | (N1..N5: % y Monto) | scores | mitigante
+    cols = ["Empresa", "Sector", "AUM Total (S/)"]
+    for L in niveles:
+        cols += [f"% Nivel {L}", f"Monto Nivel {L} (S/)"]
+    cols += ["Score MM", "Score Inund.", "Score Sequía", "Score Global",
+             f"Mitigante ({periodo})"]
+    hrow = 4
+    for j, txt in enumerate(cols, start=1):
+        c = ws.cell(row=hrow, column=j, value=txt)
+        c.font = F_HEAD; c.fill = FILL_HEAD; c.alignment = A_C; c.border = BORDER
+
+    r = hrow + 1
+    for e in emisores:
+        tot = aum_emp_tot.get(e, 0) or 0
+        sc = scores.get(e, {"mm": 0, "inu": 0, "seq": 0, "global": 0})
+        mit = _mit_lookup(e, mitigantes)
+        fila = [e, emp_sector.get(e, ""), tot]
+        for L in niveles:
+            m = aum_emp_niv.get(e, {}).get(L, 0)
+            fila += [(m / tot if tot else 0), m]
+        fila += [sc["mm"], sc["inu"], sc["seq"], sc["global"], mit]
+        for j, v in enumerate(fila, start=1):
+            c = ws.cell(row=r, column=j, value=v); c.font = F_BODY; c.border = BORDER
+            c.alignment = A_L if j in (1, 2) else (A_R if j == 3 else A_C)
+            if j == 3:
+                c.number_format = FMT_S
+            elif 4 <= j <= 13:                     # bloques de % / monto por nivel
+                c.number_format = FMT_P if (j % 2 == 0) else FMT_S
+            elif 14 <= j <= 17:                    # scores
+                c.number_format = FMT_SC; c.fill = fill_score(v)
+            elif j == 18 and fill_mit(v):          # mitigante
+                c.fill = fill_mit(v)
+        r += 1
+
+    widths = [26, 16, 18] + [11, 16] * 5 + [10, 11, 11, 12, 16]
+    for j, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(j)].width = w
+    ws.freeze_panes = "D5"
+    if r > hrow + 1:
+        ws.auto_filter.ref = f"A{hrow}:{get_column_letter(len(cols))}{r-1}"
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"Exposicion Riesgo CENEPRED - {periodo}.xlsx")
+    wb.save(out_path)
+    logfn(f"[Activos] Excel resumen generado: {out_path}")
+    return out_path
+```
+
+**2) Agrega la llamada** dentro de `generar_dashboard_activos`, justo después del bloque `try/except` que llama a `generar_excel_riesgos` (donde ya tienes `periodo`, `mitigantes` y `fx`):
+
+```python
+    try:
+        generar_excel_tabla_resumen(out_dir, districts, exp_clase, emp_sector,
+                                    mitigantes, periodo, stamp, logfn=logfn)
+    except Exception as e:
+        logfn(f"[Activos] No se pudo generar el Excel resumen: {e}")
+```
+
+Notas rápidas: usa montos sobre **toda** la cartera (sin filtro RV/RF, igual que la fila "AUM Total" del chart), el nivel CENEPRED por distrito es el `d["nivel"]` global, y los scores/mitigantes salen exactamente de la misma lógica que la tabla 4 (`_calc_scores_py` + `_mit_lookup`). Si prefieres tres columnas de score *por distrito-empresa* en lugar del score ponderado por peligro, dímelo y te ajusto esa parte.
