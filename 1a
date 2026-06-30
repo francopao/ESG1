@@ -1,0 +1,90 @@
+import pandas as pd
+import numpy as np
+import re
+
+# ---- Configuración declarativa (no índices fijos) ----
+SECTION_PATTERN = re.compile(r"dep[oó]sitos?\s+(a la vista|de ahorro|a plazo)", re.I)
+SECTION_CANON = {
+    "a la vista": "Depósitos a la Vista",
+    "de ahorro":  "Depósitos de Ahorro",
+    "a plazo":    "Depósitos a Plazo",
+}
+# Mapeo semántico de columnas por ROL, detectado por contenido, no por posición fija
+COLS_FINAL = ["Ranking", "Entidad", "Monto", "Participacion", "PorcentajeAcum"]
+
+def _to_num(x):
+    if pd.isna(x): return np.nan
+    s = str(x).strip()
+    if s in {"-", "", "n.d.", "N.D.", "--"}: return np.nan
+    s = s.replace(",", "")
+    try: return float(s)
+    except ValueError: return np.nan
+
+def detectar_secciones(raw):
+    """Devuelve lista de (nombre_canonico, fila_inicio) por patrón de texto en cualquier celda."""
+    marcas = []
+    for i in range(len(raw)):
+        fila_txt = " ".join(str(v) for v in raw.iloc[i].tolist() if pd.notna(v))
+        m = SECTION_PATTERN.search(fila_txt)
+        if m and "fuente" not in fila_txt.lower():
+            marcas.append((SECTION_CANON[m.group(1).lower()], i))
+    return marcas
+
+def es_fila_dato(fila):
+    """Firma estructural de una fila de datos: un rank entero + una entidad de texto + un monto numérico."""
+    vals = fila.tolist()
+    no_nulos = [v for v in vals if pd.notna(v) and str(v).strip() != ""]
+    if len(no_nulos) < 3: return False
+    # primer no-nulo debe ser un entero (ranking)
+    try: int(float(no_nulos[0]))
+    except (ValueError, TypeError): return False
+    # debe existir al menos un texto no numérico (entidad)
+    tiene_texto = any(isinstance(v, str) and not re.fullmatch(r"[\d\.\-,]+", v.strip()) for v in no_nulos[1:])
+    return tiene_texto
+
+def extraer_bloque(raw, ini, fin):
+    """Extrae las filas de datos de una sección [ini, fin) y las normaliza a roles semánticos."""
+    filas = []
+    for i in range(ini, fin):
+        fila = raw.iloc[i]
+        if not es_fila_dato(fila): continue
+        no_nulos = [v for v in fila.tolist() if pd.notna(v) and str(v).strip() != ""]
+        # rol por orden de aparición tras quitar vacíos: rank, entidad, monto, part, acum
+        rank   = int(float(no_nulos[0]))
+        entidad = str(no_nulos[1]).strip()
+        resto  = no_nulos[2:]
+        monto  = _to_num(resto[0]) if len(resto) > 0 else np.nan
+        part   = _to_num(resto[1]) if len(resto) > 1 else np.nan
+        acum   = _to_num(resto[2]) if len(resto) > 2 else np.nan
+        filas.append([rank, entidad, monto, part, acum])
+    return pd.DataFrame(filas, columns=COLS_FINAL)
+
+def parse_sbs_ranking(path, fecha=None, institucion=None):
+    raw = pd.read_excel(path, engine="openpyxl", header=None)
+    raw = raw.dropna(axis=1, how="all").reset_index(drop=True)
+    marcas = detectar_secciones(raw)
+    limites = [m[1] for m in marcas] + [len(raw)]
+    bloques = []
+    for k, (nombre, ini) in enumerate(marcas):
+        fin = limites[k+1]
+        bloque = extraer_bloque(raw, ini+1, fin)
+        if bloque.empty: continue
+        bloque.insert(0, "Tipo", nombre)
+        bloques.append(bloque)
+    tidy = pd.concat(bloques, ignore_index=True)
+    # Normalización de % a fracción si vienen como 0-100
+    for c in ["Participacion", "PorcentajeAcum"]:
+        if tidy[c].max(skipna=True) and tidy[c].max() > 1.5:
+            tidy[c] = tidy[c] / 100
+    if fecha is not None: tidy["Fecha"] = pd.Timestamp(fecha)
+    if institucion is not None: tidy["Institucion"] = institucion
+    return tidy
+
+if __name__ == "__main__":
+    t = parse_sbs_ranking("B-3246-my2026.XLS", fecha="2026-05-31", institucion="Financieras")
+    pd.set_option("display.width", 160, "display.max_rows", 100)
+    print(t.to_string())
+    print("\nFilas por sección:")
+    print(t.groupby("Tipo").size())
+    print("\nSuma participación por sección (control de calidad):")
+    print(t.groupby("Tipo")["Participacion"].sum())
