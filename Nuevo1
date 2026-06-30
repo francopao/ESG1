@@ -1,0 +1,199 @@
+Entiendo perfecto. Tres cambios:
+
+1. Una hoja por desastre (MM, Inundación, Sequías), con el % y monto en cada uno de los 5 niveles CENEPRED **usando el score de ESE desastre** (no el nivel global).
+2. La columna AUM Total se repite en cada hoja (no varía por desastre).
+3. Una columna nueva "Clasificación ERR" con el/los valores que tengan los instrumentos de ese emisor en la hoja Valorización.
+
+Como la lectura de "Clasificación ERR" requiere leer la hoja Valorización, hay que pasarle `risk_path` y `sheet_val` a la función. Te doy todo lo que cambia.
+
+**1) Reemplaza completa la función `generar_excel_tabla_resumen`** por esta versión:
+
+```python
+def _leer_clasificacion_err(risk_path, sheet_val, equiv_canonico):
+    """Lee la hoja Valorización y devuelve {emisor_canonico: [valores únicos de la
+    columna cuyo header contenga 'ERR' + 'CLASIF']}. Reutiliza el mapeo nombre->canónico
+    (_equiv_exposicion_all) que ya usa el resto del script."""
+    raw = pd.read_excel(risk_path, sheet_name=sheet_val, header=None)
+    hdr_row, _ = detect_header_row(raw, ["Nombre (G&P)", "VALOR_VECTOR_LOCAL"], max_scan=10)
+    df = pd.read_excel(risk_path, sheet_name=sheet_val, header=hdr_row).dropna(how="all")
+    # columna nombre
+    cols = resolve_columns(df.columns, {"nombre": (["Nombre (G&P)", "Nombre G P", "Nombre"], "H")})
+    df = df.rename(columns={cols["nombre"]: "nombre"})
+    # columna Clasificación ERR (header con 'ERR' y 'CLASIF')
+    col_err = None
+    for c in df.columns:
+        nc = norm(c)
+        if "ERR" in nc and "CLASIF" in nc:
+            col_err = c; break
+    if col_err is None:                    # respaldo: solo 'ERR'
+        for c in df.columns:
+            if "ERR" in norm(c):
+                col_err = c; break
+    if col_err is None:
+        return {}, None
+    eq_norm = {norm(k): v for k, v in (equiv_canonico or {}).items()}
+    df["emisor"] = df["nombre"].astype(str).str.strip().apply(lambda n: eq_norm.get(norm(n)))
+    out = {}
+    for e, g in df.dropna(subset=["emisor"]).groupby("emisor"):
+        vals = sorted(set(str(v).strip() for v in g[col_err].dropna()
+                          if str(v).strip() not in ("", "nan")))
+        out[e] = vals
+    return out, str(col_err)
+
+
+def generar_excel_tabla_resumen(out_dir, districts, exp_clase, emp_sector,
+                                mitigantes, periodo, risk_path, sheet_val,
+                                equiv_canonico, stamp=None, logfn=print):
+    """Excel con UNA HOJA POR DESASTRE (Movimientos de Masa / Inundación / Sequías
+    Severas). En cada hoja: por empresa, AUM Total, % y monto del AUM en cada nivel
+    CENEPRED (1-5) usando el SCORE DE ESE DESASTRE, los scores por peligro (MM/Inu/Seq
+    + Global), el mitigante y la(s) Clasificación(es) ERR de sus instrumentos."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from datetime import datetime
+
+    AZUL = "1E2E6E"
+    F_TIT = Font(name="Calibri", size=14, bold=True, color=AZUL)
+    F_SUB = Font(name="Calibri", size=10, color="7E8083")
+    F_HEAD = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+    F_BODY = Font(name="Calibri", size=10, color="1F2533")
+    FILL_HEAD = PatternFill("solid", fgColor=AZUL)
+    THIN = Side(style="thin", color="DCDDDE")
+    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    A_L = Alignment(horizontal="left", vertical="center")
+    A_C = Alignment(horizontal="center", vertical="center")
+    A_R = Alignment(horizontal="right", vertical="center")
+    A_LW = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    FMT_S = '#,##0;(#,##0);-'
+    FMT_P = '0.0%'
+    FMT_SC = '0.00'
+
+    def fill_score(v):
+        if v < 2:  return PatternFill("solid", fgColor="D4EDDA")
+        if v < 3:  return PatternFill("solid", fgColor="FFF3CD")
+        if v <= 4: return PatternFill("solid", fgColor="FFE0B2")
+        return PatternFill("solid", fgColor="F8D7DA")
+
+    def fill_mit(v):
+        return {"Bajo": PatternFill("solid", fgColor="D4EDDA"),
+                "Medio": PatternFill("solid", fgColor="FFF3CD"),
+                "Alto": PatternFill("solid", fgColor="F8D7DA")}.get(v)
+
+    niveles = [1, 2, 3, 4, 5]
+    scores = _calc_scores_py(districts)
+
+    # AUM total por emisor con score válido del desastre + AUM por (emisor, nivel del desastre)
+    # score_key: 'score_mm' | 'score_inu' | 'score_seq' del distrito
+    HZ_HOJAS = [("Movimientos de Masa", "score_mm"),
+                ("Inundación", "score_inu"),
+                ("Sequías Severas", "score_seq")]
+
+    # Clasificación ERR por emisor
+    try:
+        err_map, err_hdr = _leer_clasificacion_err(risk_path, sheet_val, equiv_canonico)
+        if err_hdr:
+            logfn(f"[Activos] Clasificación ERR leída de la columna '{err_hdr}'.")
+        else:
+            logfn("[Activos] No se halló columna 'Clasificación ERR' en Valorización; "
+                  "la columna saldrá vacía.")
+    except Exception as e:
+        err_map, err_hdr = {}, None
+        logfn(f"[Activos] No se pudo leer Clasificación ERR ({e}); columna vacía.")
+
+    wb = Workbook()
+    first = True
+    for nombre_desastre, score_key in HZ_HOJAS:
+        # AUM por (emisor, nivel) usando el score de ESTE desastre
+        aum_emp_niv, aum_emp_tot = {}, {}
+        for d in districts:
+            L = d.get(score_key)
+            if L not in niveles:
+                continue
+            for a in d.get("aportes", []):
+                m = a.get("monto", 0) or 0
+                if m <= 0:
+                    continue
+                e = a["emisor"]
+                aum_emp_niv.setdefault(e, {})
+                aum_emp_niv[e][L] = aum_emp_niv[e].get(L, 0) + m
+                aum_emp_tot[e] = aum_emp_tot.get(e, 0) + m
+        emisores = sorted(aum_emp_tot.keys())
+
+        ws = wb.active if first else wb.create_sheet()
+        first = False
+        ws.title = _safe_sheet_name(nombre_desastre)
+        ws.sheet_view.showGridLines = False
+        ws["A1"] = f"Exposición por empresa y nivel CENEPRED — {nombre_desastre}"
+        ws["A1"].font = F_TIT
+        ws["A2"] = (f"Periodo {periodo} · Generado {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
+                    f"% por empresa = AUM en el nivel / AUM total de la empresa con score "
+                    f"válido de {nombre_desastre} (fila = 100%).")
+        ws["A2"].font = F_SUB
+
+        cols = ["Empresa", "Sector", "AUM Total (S/)"]
+        for L in niveles:
+            cols += [f"% Nivel {L}", f"Monto Nivel {L} (S/)"]
+        cols += ["Score MM", "Score Inund.", "Score Sequía", "Score Global",
+                 f"Mitigante ({periodo})", "Clasificación ERR"]
+        hrow = 4
+        for j, txt in enumerate(cols, start=1):
+            c = ws.cell(row=hrow, column=j, value=txt)
+            c.font = F_HEAD; c.fill = FILL_HEAD; c.alignment = A_C; c.border = BORDER
+
+        r = hrow + 1
+        for e in emisores:
+            tot = aum_emp_tot.get(e, 0) or 0
+            sc = scores.get(e, {"mm": 0, "inu": 0, "seq": 0, "global": 0})
+            mit = _mit_lookup(e, mitigantes)
+            err = "; ".join(err_map.get(e, [])) or "—"
+            fila = [e, emp_sector.get(e, ""), tot]
+            for L in niveles:
+                m = aum_emp_niv.get(e, {}).get(L, 0)
+                fila += [(m / tot if tot else 0), m]
+            fila += [sc["mm"], sc["inu"], sc["seq"], sc["global"], mit, err]
+            for j, v in enumerate(fila, start=1):
+                c = ws.cell(row=r, column=j, value=v); c.font = F_BODY; c.border = BORDER
+                if j == 19:
+                    c.alignment = A_LW
+                else:
+                    c.alignment = A_L if j in (1, 2) else (A_R if j == 3 else A_C)
+                if j == 3:
+                    c.number_format = FMT_S
+                elif 4 <= j <= 13:
+                    c.number_format = FMT_P if (j % 2 == 0) else FMT_S
+                elif 14 <= j <= 17:
+                    c.number_format = FMT_SC; c.fill = fill_score(v)
+                elif j == 18 and fill_mit(v):
+                    c.fill = fill_mit(v)
+            r += 1
+
+        widths = [26, 16, 18] + [11, 16] * 5 + [10, 11, 11, 12, 16, 30]
+        for j, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(j)].width = w
+        ws.freeze_panes = "D5"
+        if r > hrow + 1:
+            ws.auto_filter.ref = f"A{hrow}:{get_column_letter(len(cols))}{r-1}"
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"Exposicion Riesgo CENEPRED - {periodo}.xlsx")
+    wb.save(out_path)
+    logfn(f"[Activos] Excel resumen (por desastre) generado: {out_path}")
+    return out_path
+```
+
+**2) Cambia la llamada** del paso anterior (dentro de `generar_dashboard_activos`) para pasarle los dos parámetros nuevos. El problema: `generar_dashboard_activos` **no recibe** `sheet_val` ni `equiv_canonico`. La forma más limpia y sin tocar firmas es leer `sheet_val` con la función `pick_sheet` que ya existe, y construir el equiv con `_equiv_exposicion_all()`:
+
+```python
+    # Excel resumen: exposición por empresa x nivel CENEPRED (una hoja por desastre)
+    try:
+        periodo = _periodo_actual(mitigantes_path)
+        sheet_val = pick_sheet(risk_path, SHEET_VALORIZ_HINTS, "Valorización de Instrumentos")
+        generar_excel_tabla_resumen(out_dir, districts, exp_clase, emp_sector,
+                                    mitigantes, periodo, risk_path, sheet_val,
+                                    _equiv_exposicion_all(), stamp, logfn=logfn)
+    except Exception as e:
+        logfn(f"[Activos] No se pudo generar el Excel resumen: {e}")
+```
+
+Un punto a confirmar sobre **"Clasificación ERR"**: el header exacto. Mi código busca una columna cuyo nombre normalizado contenga `ERR` **y** `CLASIF` (y como respaldo, solo `ERR`). Si tu header es por ejemplo "Clasificación E.R.R." o "Clasif. ERR riesgo", igual lo encuentra. Si el nombre real no contiene literalmente "ERR" (p. ej. usa "EL" de Expected Loss), dime el header exacto y ajusto el filtro.
