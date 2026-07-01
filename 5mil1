@@ -1,0 +1,6 @@
+import os
+carpeta = r"Z:\Benchmarking"
+print("¿Existe la carpeta?:", os.path.isdir(carpeta))
+for f in os.listdir(carpeta):
+    if "BDPrecios" in f or "BDPrecio" in f:
+        print(repr(f))
